@@ -1,0 +1,23 @@
+# Quality gating for Argo Rollouts users, without the ModelGate controller.
+# Model pods still need the capture sidecar, with MODELGATE_REVISION set to
+# the pod's rollouts-pod-template-hash label (via the downward API).
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: modelgate-quality
+spec:
+  args:
+    - name: rollout          # namespace/name, as the sidecar reports it
+    - name: stable-hash
+    - name: canary-hash
+  metrics:
+    - name: model-quality
+      interval: 1m
+      failureLimit: 1
+      inconclusiveLimit: 30
+      successCondition: result == "pass"
+      failureCondition: result == "fail"
+      provider:
+        web:
+          url: "http://modelgate-analyzer.modelgate-system.svc/v1/argo/verdict?rollout={{args.rollout}}&stable={{args.stable-hash}}&canary={{args.canary-hash}}&window=10m&minSamples=2000&checks=pred-shift:psi:max=0.1,score-shape:ks:max=0.1,valid:validity:max=0,latency:p99Ratio:max=1.2,errors:errorRate:max=0.01"
+          jsonPath: "{$.decision}"

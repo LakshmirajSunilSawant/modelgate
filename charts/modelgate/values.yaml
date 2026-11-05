@@ -1,0 +1,27 @@
+image:
+  registry: ghcr.io/modelgate
+  tag: ""            # defaults to the chart appVersion
+  pullPolicy: IfNotPresent
+
+controller:
+  replicas: 2        # leader election keeps one active
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+analyzer:
+  replicas: 1        # sketches live in memory; replay from NATS rebuilds them after a restart
+  bucket: 15s
+  retention: 3h
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+
+# NATS JetStream URL. Leave empty to send events from sidecars to the
+# analyzer over HTTP (fine for a local demo; no replay after analyzer restarts).
+nats:
+  url: ""
+
+# Set to "true" to freeze every rollout in the cluster at its current weight.
+killSwitch:
+  freeze: "false"

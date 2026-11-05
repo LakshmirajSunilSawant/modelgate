@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelgate-analyzer
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+    app.kubernetes.io/name: modelgate-analyzer
+spec:
+  replicas: {{ .Values.analyzer.replicas }}
+  selector:
+    matchLabels: { app.kubernetes.io/name: modelgate-analyzer }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: modelgate-analyzer }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: analyzer
+          image: {{ .Values.image.registry }}/modelgate-analyzer:{{ include "modelgate.tag" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --listen=:8090
+            - --bucket={{ .Values.analyzer.bucket }}
+            - --retention={{ .Values.analyzer.retention }}
+            {{- with .Values.nats.url }}
+            - --nats-url={{ . }}
+            {{- end }}
+          ports:
+            - { name: http, containerPort: 8090 }
+          livenessProbe: { httpGet: { path: /healthz, port: http } }
+          readinessProbe: { httpGet: { path: /healthz, port: http } }
+          resources: {{- toYaml .Values.analyzer.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelgate-analyzer
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: modelgate-analyzer }
+  ports:
+    - { name: http, port: 80, targetPort: http }

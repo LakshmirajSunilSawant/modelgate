@@ -1,0 +1,70 @@
+# Demo rollout: the breast cancer classifier from demo/model behind Envoy Gateway.
+# To start a rollout, change MODEL_VARIANT (or the image) in spec.template.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-model
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /predict }
+      # backendRefs and RequestMirror filters are managed by ModelGate.
+---
+apiVersion: modelgate.dev/v1alpha1
+kind: ModelRollout
+metadata:
+  name: demo-model
+  namespace: demo
+spec:
+  replicas: 1
+  modelPort: 8080
+  routeRef: { name: demo-model }
+  template:
+    spec:
+      containers:
+        - name: model
+          image: modelgate-demo-model:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: MODEL_VARIANT, value: good }
+          ports:
+            - { containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+  output:
+    type: classification
+    labelPath: $.prediction.label
+    scorePath: $.prediction.confidence
+    scoreRange: { min: 0, max: 1 }
+  strategy:
+    shadow: { duration: 5m, sampleRate: 1 }
+    steps:
+      - { weight: 5,  pause: 3m }
+      - { weight: 25, pause: 3m }
+      - { weight: 50, pause: 3m }
+  analysis:
+    minSamples: 1000
+    failureLimit: 2
+    interval: 20s
+    checks:
+      - { name: agreement,   type: agreementRate, min: 0.97, phase: shadow }
+      - { name: pred-shift,  type: psi,           max: 0.10 }
+      - { name: score-shape, type: ks,            max: 0.10 }
+      - { name: valid,       type: validity,      max: 0 }
+      - { name: latency,     type: p99Ratio,      max: 1.20 }
+      - { name: errors,      type: errorRate,     max: 0.01 }

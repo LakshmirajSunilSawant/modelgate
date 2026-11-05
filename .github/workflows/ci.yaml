@@ -1,0 +1,38 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: envtest (real kube-apiserver)
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21
+          KUBEBUILDER_ASSETS="$(setup-envtest use 1.33.0 -p path)" go test ./internal/controller/ -run Envtest -v
+      - run: go run ./hack/loadtest -rps 1000 -duration 20s
+      - name: generated code is up to date
+        run: |
+          go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
+          make generate manifests
+          git diff --exit-code
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/modelgate
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r demo/model/requirements.txt
+      - run: make smoke
+      - run: make bench
