@@ -115,19 +115,60 @@ func TestProxyRecordsErrors(t *testing.T) {
 	}
 }
 
+// TestProxyUpstreamDown: before the model has ever answered, it is still
+// starting, so refused connections are not recorded as model errors. Once
+// it has answered, the model going away is an error.
 func TestProxyUpstreamDown(t *testing.T) {
-	u, _ := url.Parse("http://127.0.0.1:1")
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }))
+	u, _ := url.Parse(model.URL)
+	model.Close() // not listening yet
 	pub := &memPub{}
 	p, _ := NewProxy(Config{Upstream: u, Rollout: "ns/x", Revision: "r", SampleRate: 1}, pub)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
-	resp, err := http.Get(srv.URL)
+	get := func() int {
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get(); code != 502 {
+		t.Fatalf("status %d while the model is starting", code)
+	}
+	time.Sleep(50 * time.Millisecond)
+	pub.mu.Lock()
+	n := len(pub.events)
+	pub.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d events recorded while the model was starting", n)
+	}
+
+	p.modelUp.Store(true) // as after the model's first response
+	if code := get(); code != 502 {
+		t.Fatalf("status %d", code)
+	}
+	if e := pub.wait(t, 1)[0]; e.Status != 502 || !e.IsError() {
+		t.Errorf("event after the model went away: %+v", e)
+	}
+}
+
+func TestProxyMarksModelUpOnFirstResponse(t *testing.T) {
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer model.Close()
+	u, _ := url.Parse(model.URL)
+	p, _ := NewProxy(Config{Upstream: u, SampleRate: 1}, &memPub{})
+	front := httptest.NewServer(p)
+	defer front.Close()
+	resp, err := http.Get(front.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if e := pub.wait(t, 1)[0]; resp.StatusCode != 502 || e.Status != 502 {
-		t.Errorf("status %d event %+v", resp.StatusCode, e)
+	if !p.modelUp.Load() {
+		t.Error("modelUp not set after a response")
 	}
 }
 

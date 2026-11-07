@@ -64,6 +64,17 @@ minor versions may change it; such changes are called out below.
 - A namespace policy's `minSamples` floor also applies to per-check
   `minSamples`, except for label checks.
 
+### Fixed
+
+- The sidecar no longer records refused connections as model errors before
+  the model has answered once. Gateways that send traffic to pods that are
+  not ready yet (Envoy Gateway marks them draining, and Envoy still uses
+  them when no endpoint is healthy) could otherwise roll back a good canary
+  on its startup errors.
+- GRPCRoutes always list the canary Service (at weight 0 when it gets no
+  live traffic), because Envoy Gateway only resolves mirror targets that
+  the route also names as a backend.
+
 ## [0.1.0]
 
 ### Added

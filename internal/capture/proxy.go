@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -71,6 +72,9 @@ type Proxy struct {
 	pub     Publisher
 	rp      *httputil.ReverseProxy
 	limiter payloadLimiter
+	// modelUp is set once the model server has answered any request.
+	// Before that, connection failures are startup, not model errors.
+	modelUp atomic.Bool
 	now     func() time.Time
 	Metrics *Metrics
 }
@@ -160,7 +164,14 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if c, ok := r.Context().Value(ctxKey{}).(*capture); ok {
-				p.emit(c, http.StatusBadGateway, nil, "", p.payload(c, nil, false, "model server unreachable"))
+				if !p.modelUp.Load() {
+					// The model has not answered yet: it is still starting. Some
+					// gateways send traffic to pods that are not ready yet, and
+					// those failures say nothing about the model's quality.
+					p.Metrics.Captured.WithLabelValues("model_starting").Inc()
+				} else {
+					p.emit(c, http.StatusBadGateway, nil, "", p.payload(c, nil, false, "model server unreachable"))
+				}
 			}
 			w.WriteHeader(http.StatusBadGateway)
 		},
@@ -242,6 +253,7 @@ func (p *Proxy) wantPayload(id string, now time.Time) bool {
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
+	p.modelUp.Store(true)
 	c, ok := resp.Request.Context().Value(ctxKey{}).(*capture)
 	if !ok {
 		return nil
