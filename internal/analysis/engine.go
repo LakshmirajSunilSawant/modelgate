@@ -20,7 +20,15 @@ const (
 	CheckValidity      = "validity"      // share of invalid outputs (NaN, out of range, schema)
 	CheckP99Ratio      = "p99Ratio"      // canary p99 latency / stable p99 latency
 	CheckErrorRate     = "errorRate"     // canary error rate
+	// CheckLabelAccuracy compares accuracy against delayed ground-truth
+	// labels: stable accuracy minus canary accuracy, in [−1, 1].
+	CheckLabelAccuracy = "labelAccuracy"
 )
+
+// defaultLabelMinSamples is the number of labeled predictions per version a
+// labelAccuracy check needs when it sets no minSamples of its own. Labels
+// are usually far scarcer than predictions.
+const defaultLabelMinSamples = 200
 
 // Phases.
 const (
@@ -44,19 +52,25 @@ type CheckSpec struct {
 	Min   *float64 `json:"min,omitempty"`
 	Max   *float64 `json:"max,omitempty"`
 	Phase string   `json:"phase,omitempty"` // shadow | canary | "" for both
+	// MinSamples overrides Request.MinSamples for this check.
+	MinSamples *int64 `json:"minSamples,omitempty"`
 }
 
 // Request asks for a verdict on a canary revision against the stable one.
 type Request struct {
-	Rollout    string      `json:"rollout"` // "namespace/name"
-	Stable     string      `json:"stable"`
-	Canary     string      `json:"canary"`
-	Since      time.Time   `json:"since"`
-	Phase      string      `json:"phase"`
-	Look       int         `json:"look,omitempty"` // 0: analyzer counts looks itself
-	MinSamples int64       `json:"minSamples"`
-	Alpha      float64     `json:"alpha,omitempty"` // false-alarm budget per check per stage
-	Checks     []CheckSpec `json:"checks"`
+	Rollout string    `json:"rollout"` // "namespace/name"
+	Stable  string    `json:"stable"`
+	Canary  string    `json:"canary"`
+	Since   time.Time `json:"since"`
+	// RolloutStart is when the rollout began. labelAccuracy counts labels
+	// from the whole rollout, because ground truth for one stage usually
+	// arrives after that stage has ended. Zero falls back to Since.
+	RolloutStart time.Time   `json:"rolloutStart,omitempty"`
+	Phase        string      `json:"phase"`
+	Look         int         `json:"look,omitempty"` // 0: analyzer counts looks itself
+	MinSamples   int64       `json:"minSamples"`
+	Alpha        float64     `json:"alpha,omitempty"` // false-alarm budget per check per stage
+	Checks       []CheckSpec `json:"checks"`
 }
 
 // CheckResult is the outcome of one check.
@@ -118,7 +132,17 @@ func (e *Engine) Evaluate(req Request) Verdict {
 	ca := e.Store.Track(req.Rollout, req.Canary, req.Since)
 	pr := e.Store.Pair(req.Rollout, req.Stable, req.Canary, req.Since)
 
-	c := checkCtx{req: req, look: look, alphaLook: stats.LookAlpha(req.Alpha, look), stable: st, canary: ca, pair: pr}
+	c := checkCtx{req: req, look: look, alphaLook: stats.LookAlpha(req.Alpha, look), stable: st, canary: ca, pair: pr,
+		labStable: st, labCanary: ca}
+	if !req.RolloutStart.IsZero() && req.RolloutStart.Before(req.Since) {
+		for _, spec := range req.Checks {
+			if spec.Type == CheckLabelAccuracy {
+				c.labStable = e.Store.Track(req.Rollout, req.Stable, req.RolloutStart)
+				c.labCanary = e.Store.Track(req.Rollout, req.Canary, req.RolloutStart)
+				break
+			}
+		}
+	}
 	v := Verdict{Look: look, StableSamples: st.Requests, CanarySamples: ca.Requests, PairedSamples: max(pr.N, pr.ScoredN)}
 	for _, spec := range req.Checks {
 		v.Checks = append(v.Checks, c.run(spec))
@@ -166,6 +190,8 @@ type checkCtx struct {
 	alphaLook      float64
 	stable, canary *TrackStats
 	pair           *PairStats
+	// Stats since the rollout started, for label checks.
+	labStable, labCanary *TrackStats
 }
 
 func (c *checkCtx) run(s CheckSpec) CheckResult {
@@ -203,6 +229,8 @@ func (c *checkCtx) run(s CheckSpec) CheckResult {
 		c.errorRate(s, &r)
 	case CheckP99Ratio:
 		c.p99Ratio(s, &r)
+	case CheckLabelAccuracy:
+		c.labelAccuracy(s, &r)
 	default:
 		r.Status = Fail
 		r.Message = fmt.Sprintf("%s: unknown check type %q", s.Name, s.Type)
@@ -221,6 +249,7 @@ var defaultThresholds = map[string]float64{
 	CheckValidity:      0,
 	CheckErrorRate:     0.01,
 	CheckP99Ratio:      1.2,
+	CheckLabelAccuracy: 0.02,
 }
 
 // DefaultThreshold returns the threshold a check of this type uses when
@@ -242,13 +271,48 @@ func threshold(p *float64, def float64) float64 {
 }
 
 func (c *checkCtx) enough(r *CheckResult, n int64) bool {
+	return c.enoughOf(r, n, c.req.MinSamples)
+}
+
+func (c *checkCtx) enoughOf(r *CheckResult, n, need int64) bool {
 	r.Samples = n
-	if n < c.req.MinSamples {
+	if n < need {
 		r.Status = Inconclusive
-		r.Message = fmt.Sprintf("%s: %d/%d samples", r.Name, n, c.req.MinSamples)
+		r.Message = fmt.Sprintf("%s: %d/%d samples", r.Name, n, need)
 		return false
 	}
 	return true
+}
+
+// labelAccuracy fails when the canary is confidently less accurate than
+// stable on predictions whose ground truth has arrived: the lower confidence
+// bound of (stable accuracy − canary accuracy) exceeds max. Each side gets
+// half of the look's alpha. Until enough labels arrive it is inconclusive,
+// so a rollout that requires labels waits for them rather than promoting.
+func (c *checkCtx) labelAccuracy(s CheckSpec, r *CheckResult) {
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
+	need := int64(defaultLabelMinSamples)
+	if s.MinSamples != nil {
+		need = *s.MinSamples
+	}
+	st, ca := c.labStable, c.labCanary
+	if !c.enoughOf(r, min(st.Labeled, ca.Labeled), need) {
+		r.Message += " with ground-truth labels"
+		return
+	}
+	accS := ratio(st.Correct, st.Labeled)
+	accC := ratio(ca.Correct, ca.Labeled)
+	loS, _ := stats.BernoulliBounds(st.Correct, st.Labeled, c.alphaLook/2)
+	_, hiC := stats.BernoulliBounds(ca.Correct, ca.Labeled, c.alphaLook/2)
+	r.Value, r.Bound = accS-accC, loS-hiC
+	if r.Bound > r.Threshold {
+		r.Status = Fail
+		r.Message = fmt.Sprintf("%s: accuracy %.4f vs stable %.4f (drop at least %.4f) exceeds max drop %.4f",
+			s.Name, accC, accS, r.Bound, r.Threshold)
+		return
+	}
+	r.Status = Pass
+	r.Message = fmt.Sprintf("%s: accuracy %.4f vs stable %.4f on %d/%d labels", s.Name, accC, accS, ca.Labeled, st.Labeled)
 }
 
 func (c *checkCtx) comparativeN() int64 {

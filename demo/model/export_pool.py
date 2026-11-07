@@ -28,11 +28,18 @@ def main():
     from sklearn.datasets import load_breast_cancer
 
     rng = random.Random(0)
-    rows = load_breast_cancer().data.tolist()
+    data = load_breast_cancer()
+    rows = data.data.tolist()
     # Same perturbation as loadgen.py: live traffic resembles, but is not, the training data.
-    pool = [[v * rng.uniform(0.97, 1.03) for v in rng.choice(rows)] for _ in range(args.size)]
+    # Choosing an index draws the same random numbers as choosing a row, so
+    # the pool is unchanged from earlier versions; the index gives the truth.
+    pool, picks = [], []
+    for _ in range(args.size):
+        i = rng.choice(range(len(rows)))
+        picks.append(i)
+        pool.append([v * rng.uniform(0.97, 1.03) for v in rows[i]])
 
-    out = {"size": args.size, "variants": {}}
+    out = {"size": args.size, "truth": [str(data.target_names[data.target[i]]) for i in picks], "variants": {}}
     for v in VARIANTS:
         os.environ["MODEL_VARIANT"] = v
         app = importlib.reload(importlib.import_module("app")) if "app" in sys.modules else importlib.import_module("app")

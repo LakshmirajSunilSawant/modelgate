@@ -12,6 +12,19 @@ spec:
       protocol: HTTP
       port: 80
 ---
+# Keep the client's X-Request-Id. Envoy replaces it by default, and delayed
+# labels (labelAccuracy) are joined to predictions by the ID the client knows.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: demo-preserve-request-id
+  namespace: demo
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: Gateway, name: demo }
+  headers:
+    requestID: Preserve
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:

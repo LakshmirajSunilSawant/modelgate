@@ -28,7 +28,8 @@ import (
 )
 
 type pool struct {
-	Size     int `json:"size"`
+	Size     int      `json:"size"`
+	Truth    []string `json:"truth"`
 	Variants map[string]struct {
 		Labels []string   `json:"labels"`
 		Scores []*float64 `json:"scores"`
@@ -78,12 +79,30 @@ type outcome struct {
 	exposure float64       // share of user requests served by the canary
 }
 
+// Delayed-label mode (-label-delay > 0): a labelAccuracy check is added,
+// and a -label-rate share of requests receives its true class that long
+// after being served. With -labels-only the label-free quality checks are
+// dropped, which shows how long ground truth alone takes.
+var (
+	labelDelay time.Duration
+	labelRate  float64
+)
+
 func main() {
 	poolPath := flag.String("pool", "bench/pool.json", "prediction pool from export_pool.py")
 	runs := flag.Int("runs", 50, "runs per variant")
 	rps := flag.Float64("rps", 50, "user requests per second")
 	only := flag.String("variants", "identical,swapped,scaling,stale,accuracy-drop,nan,slow", "comma-separated variants")
+	flag.DurationVar(&labelDelay, "label-delay", 0, "delay before ground-truth labels arrive; 0 disables labels")
+	flag.Float64Var(&labelRate, "label-rate", 0.5, "share of requests that get a ground-truth label")
+	labelsOnly := flag.Bool("labels-only", false, "drop the label-free quality checks (needs -label-delay)")
 	flag.Parse()
+	if labelDelay > 0 {
+		if *labelsOnly {
+			checks = []analysis.CheckSpec{checks[3], checks[4], checks[5]} // validity, latency, errors
+		}
+		checks = append(checks, analysis.CheckSpec{Name: "accuracy", Type: analysis.CheckLabelAccuracy, Max: f(0.02)})
+	}
 
 	raw, err := os.ReadFile(*poolPath)
 	if err != nil {
@@ -96,7 +115,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("ModelGate bad-model suite: %d runs per variant, %.0f req/s, minSamples %d, PRD stages (shadow 10m@20%%, 5%%/10m, 25%%/15m, 50%%/15m)\n\n", *runs, *rps, minSamples)
+	fmt.Printf("ModelGate bad-model suite: %d runs per variant, %.0f req/s, minSamples %d, PRD stages (shadow 10m@20%%, 5%%/10m, 25%%/15m, 50%%/15m)\n", *runs, *rps, minSamples)
+	if labelDelay > 0 {
+		if len(p.Truth) != p.Size {
+			fmt.Fprintln(os.Stderr, "pool has no ground truth; re-export it with demo/model/export_pool.py")
+			os.Exit(1)
+		}
+		fmt.Printf("Delayed labels: %.0f%% of requests labeled after %s; labels-only=%v\n", labelRate*100, labelDelay, *labelsOnly)
+	}
+	fmt.Println()
 	fmt.Println("| Variant | Expected | Caught | False rollback | Median time to decision | Median exposure | Caught by | Stage of decision |")
 	fmt.Println("| --- | --- | --- | --- | --- | --- | --- | --- |")
 	for _, v := range strings.Split(*only, ",") {
@@ -184,12 +211,17 @@ func latency(r *rand.Rand, slow bool) float64 {
 func simulate(p *pool, variant string, rps float64, seed int64) outcome {
 	r := rand.New(rand.NewSource(seed))
 	t0 := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
-	store := analysis.NewStore(analysis.StoreOptions{Now: func() time.Time { return t0 }})
+	now := t0
+	store := analysis.NewStore(analysis.StoreOptions{Now: func() time.Time { return now }})
 	eng := &analysis.Engine{Store: store}
 	good, canary := p.Variants["good"], p.Variants[variant]
 	slow := variant == "slow"
 
-	now := t0
+	type due struct {
+		at time.Time
+		o  analysis.Outcome
+	}
+	var pendingLabels []due
 	var userReqs, canaryUser float64
 	seq := 0
 	event := func(rev string, id string, i int, labels []string, scores []*float64, isSlow bool) analysis.Event {
@@ -225,6 +257,9 @@ func simulate(p *pool, variant string, rps float64, seed int64) outcome {
 				id := fmt.Sprint(seq)
 				i := r.Intn(p.Size)
 				userReqs++
+				if labelDelay > 0 && r.Float64() < labelRate {
+					pendingLabels = append(pendingLabels, due{now.Add(labelDelay), analysis.Outcome{Rollout: "bench/m", RequestID: id, Label: p.Truth[i]}})
+				}
 				switch {
 				case st.shadow:
 					batch = append(batch, event("stable", id, i, good.Labels, good.Scores, false))
@@ -239,7 +274,16 @@ func simulate(p *pool, variant string, rps float64, seed int64) outcome {
 				}
 			}
 			store.Ingest(batch...)
+			k := 0
+			for k < len(pendingLabels) && !pendingLabels[k].at.After(now) {
+				store.IngestOutcomes(pendingLabels[k].o)
+				k++
+			}
+			pendingLabels = pendingLabels[k:]
 			now = now.Add(time.Second)
+			if now.Second() == 0 {
+				store.GC() // as the analyzer does every minute
+			}
 			if now.Before(nextLook) {
 				continue
 			}
@@ -251,7 +295,7 @@ func simulate(p *pool, variant string, rps float64, seed int64) outcome {
 			}
 			look++
 			v := eng.Evaluate(analysis.Request{
-				Rollout: "bench/m", Stable: "stable", Canary: "canary", Since: start,
+				Rollout: "bench/m", Stable: "stable", Canary: "canary", Since: start, RolloutStart: t0,
 				Phase: phase, Look: look, MinSamples: minSamples, Alpha: analysis.DefaultAlpha, Checks: checks,
 			})
 			switch v.Decision {

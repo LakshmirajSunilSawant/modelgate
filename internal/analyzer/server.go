@@ -29,6 +29,8 @@ type Server struct {
 	ingested  prometheus.Counter
 	verdicts  *prometheus.CounterVec
 	checkVals *prometheus.GaugeVec
+	outcomes  prometheus.Counter
+	scored    prometheus.Counter
 }
 
 // NewServer wires routes and metrics.
@@ -37,7 +39,9 @@ func NewServer(eng *analysis.Engine, log *slog.Logger) *Server {
 	s.ingested = prometheus.NewCounter(prometheus.CounterOpts{Name: "modelgate_analyzer_events_total", Help: "Prediction events ingested."})
 	s.verdicts = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "modelgate_analyzer_verdicts_total", Help: "Verdicts served."}, []string{"rollout", "decision"})
 	s.checkVals = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "modelgate_analyzer_check_value", Help: "Latest value of each check."}, []string{"rollout", "check", "type"})
-	s.reg.MustRegister(s.ingested, s.verdicts, s.checkVals, prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	s.outcomes = prometheus.NewCounter(prometheus.CounterOpts{Name: "modelgate_analyzer_outcomes_total", Help: "Ground-truth labels received."})
+	s.scored = prometheus.NewCounter(prometheus.CounterOpts{Name: "modelgate_analyzer_outcomes_scored_total", Help: "Predictions scored against a ground-truth label."})
+	s.reg.MustRegister(s.ingested, s.verdicts, s.checkVals, s.outcomes, s.scored, prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 	return s
 }
 
@@ -45,6 +49,7 @@ func NewServer(eng *analysis.Engine, log *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", s.handleEvents)
+	mux.HandleFunc("POST /v1/outcomes", s.handleOutcomes)
 	mux.HandleFunc("POST /v1/verdict", s.handleVerdict)
 	mux.HandleFunc("GET /v1/argo/verdict", s.handleArgo)
 	mux.HandleFunc("POST /v1/flagger/check", s.handleFlagger)
@@ -99,6 +104,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Ingest(events)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleOutcomes takes delayed ground-truth labels as a JSON array of
+// {"rollout": "ns/name", "requestId": "...", "label": "..."} and joins them
+// with the captured predictions for labelAccuracy checks.
+func (s *Server) handleOutcomes(w http.ResponseWriter, r *http.Request) {
+	var outcomes []analysis.Outcome
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20)).Decode(&outcomes); err != nil {
+		http.Error(w, "bad outcomes: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	scored := s.Engine.Store.IngestOutcomes(outcomes...)
+	s.outcomes.Add(float64(len(outcomes)))
+	s.scored.Add(float64(scored))
+	writeJSON(w, http.StatusAccepted, map[string]int{"received": len(outcomes), "scored": scored})
 }
 
 func (s *Server) evaluate(req analysis.Request) analysis.Verdict {
@@ -282,6 +302,12 @@ func ParseChecks(s string) ([]analysis.CheckSpec, error) {
 				}
 			case "phase":
 				c.Phase = v
+			case "minSamples":
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n < 1 {
+					return nil, fmt.Errorf("check %q: minSamples must be a positive integer", item)
+				}
+				c.MinSamples = &n
 			default:
 				return nil, fmt.Errorf("check %q: unknown option %q", item, k)
 			}

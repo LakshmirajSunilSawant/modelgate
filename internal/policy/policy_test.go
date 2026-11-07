@@ -85,3 +85,22 @@ func TestNilPolicy(t *testing.T) {
 		t.Error("nil policy changed the rollout")
 	}
 }
+
+func TestPerCheckMinSamplesCannotUndercutFloor(t *testing.T) {
+	floor := int64(1000)
+	low, labels := int64(10), int64(50)
+	spec := &mgv1.ModelRolloutSpec{Analysis: mgv1.AnalysisSpec{MinSamples: 2000, Checks: []mgv1.CheckSpec{
+		{Name: "shift", Type: "psi", MinSamples: &low},
+		{Name: "acc", Type: "labelAccuracy", MinSamples: &labels},
+	}}}
+	res := Apply(&mgv1.ModelGatePolicySpec{MinSamples: &floor}, spec)
+	if got := *spec.Analysis.Checks[0].MinSamples; got != floor {
+		t.Errorf("psi minSamples %d, want %d", got, floor)
+	}
+	if got := *spec.Analysis.Checks[1].MinSamples; got != labels {
+		t.Errorf("labelAccuracy minSamples changed to %d", got)
+	}
+	if len(res.Tightened) != 1 {
+		t.Errorf("tightened %v", res.Tightened)
+	}
+}

@@ -21,7 +21,8 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | Namespace defaults (`ModelGatePolicy`) enforced at runtime + validating webhook | done; envtest and live on kind |
 | PostgreSQL audit log (verdicts, disagreement samples, every decision and actor) | done; unit, real Postgres, and live on kind |
 | Grafana dashboard (Helm ConfigMap for the Grafana sidecar) | done |
-| Delayed-label accuracy, replay mode, KServe/gRPC | **not yet** (post-v0.1) |
+| Delayed-label accuracy (`labelAccuracy` check, `/v1/outcomes` API) | done; unit, benchmark, live on kind |
+| Replay mode, KServe/gRPC, raw payload capture | **not yet** (post-v0.1) |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
 | kind e2e in CI (NATS, Postgres, Envoy Gateway), Chaos Mesh run | done; see [hack/e2e/run.sh](hack/e2e/run.sh) |
 | Release: multi-arch images, SBOMs, cosign signatures, vulnerability scans | done; [release workflow](.github/workflows/release.yaml), not yet run on a tag |
@@ -71,8 +72,39 @@ client ──► Gateway                                                        
 | `validity` (hard) | all | any invalid output when `max: 0`, else lower bound > `max` |
 | `errorRate` (hard) | all | lower bound of canary 5xx rate > `max` |
 | `p99Ratio` | all | canary p99 (lower band) / stable p99 (upper band) > `max` |
+| `labelAccuracy` | classification | lower bound of (stable accuracy − canary accuracy) on delayed ground-truth labels > `max` (default 0.02) |
+
+### Delayed labels
+
+When true outcomes arrive later (a chargeback, a confirmed diagnosis), post them to the analyzer and add a `labelAccuracy` check:
+
+```sh
+curl -X POST http://modelgate-analyzer.modelgate-system.svc/v1/outcomes -d \
+  '[{"rollout": "demo/demo-model", "requestId": "4f1c...", "label": "benign"}]'
+```
+
+```yaml
+- { name: accuracy, type: labelAccuracy, max: 0.02, minSamples: 200 }
+```
+
+- Labels are joined to the captured predictions by request ID, so the client's `X-Request-Id` must be the ID it later reports the outcome for. Predictions wait up to an hour for their label. Gateways often replace that header: Envoy Gateway does unless a `ClientTrafficPolicy` sets `headers.requestID: Preserve`, as [config/samples/demo.yaml](config/samples/demo.yaml) does.
+- Each label counts in the time bucket its prediction was served in. The check pools labels over the whole rollout, because the labels for one stage usually arrive after that stage has ended.
+- `minSamples` on the check counts labeled predictions per version, 200 by default. Until there are enough, the check is inconclusive and the rollout holds at its current weight rather than promoting. A namespace policy's `minSamples` floor does not apply to label checks.
 
 ## Quickstart
+
+### One command on kind
+
+```sh
+pip install -r demo/model/requirements.txt
+hack/quickstart.sh       # cluster, images, ModelGate, audit DB, Prometheus, Grafana, demo traffic
+hack/demo.sh bad swapped # ship a broken model and watch it roll back
+hack/demo.sh good        # ship a retrained model and watch it promote
+hack/demo.sh audit       # the audit trail
+hack/quickstart.sh down  # stop the background traffic; "delete" removes the cluster
+```
+
+The script builds and installs everything from source and starts 50 req/s of demo traffic, plus ground-truth labels 20 s after each request. It then prints the Grafana URL (`http://localhost:3000/d/modelgate`) and the next commands. The demo rollout uses short stages (shadow 60 s, then 20% and 50% for 45 s each), so a good model promotes in about three minutes. `kubectl modelgate status demo-model -n demo -w` follows a rollout live.
 
 ### Local, no cluster (about 1 minute)
 
@@ -219,6 +251,18 @@ make vulncheck  # govulncheck on the module
 
 The latency regression misses the 15-minute target at low traffic. It can only be judged on split traffic, and the 5% step needs 2000 canary samples: 17.5 min at 100 req/s, 14.0 min at 200 req/s. The accuracy-drop variant is caught because it disagrees with the good model on about 7% of requests. A regression that keeps decisions this close to the good model's would still need delayed labels. The identical variant has exactly equal predictions, so its false-alarm rate tests sampling noise in split traffic; the unit tests also cover noisy near-identical models.
 
+#### With delayed labels only
+
+The hardest case in the PRD: what if the label-free checks were blind to the accuracy drop? `go run ./hack/benchmark -variants identical,accuracy-drop -label-delay <d> -label-rate 0.5 -labels-only` removes every label-free quality check (only validity, latency and errors remain) and adds `labelAccuracy` (max drop 0.02). Half of the requests get their true diagnosis after the delay. The rollout config and 50 runs per variant are as above.
+
+| Label delay | accuracy-drop caught | Median time to rollback | Median exposure | identical: false rollbacks | identical: median time to promote |
+| --- | --- | --- | --- | --- | --- |
+| 1 min | 50/50 | 6.5 min | 0% (shadow) | 0/50 | 53.5 min |
+| 10 min | 50/50 | 15.0 min | 1.3% | 0/50 | 54.5 min |
+| 30 min | 50/50 | 35.0 min | 0.56% | 0/50 | 74.5 min |
+
+Ground truth alone catches the 5.8-point drop every time, roughly the label delay plus five minutes later. The cost is time: with 30-minute labels, a good model waits about 20 extra minutes in its last stage for enough labels before it is promoted.
+
 ### Sidecar overhead
 
 `make loadtest`: open-loop at 1,000 req/s for 30 s, 5 ms model, capture on every request. The sidecar adds **0.13 ms at p99** (5.85 to 5.98 ms) and drops no events. Measured on one Windows dev machine, client and server on the same host, so treat it as indicative, not per-pod.
@@ -228,6 +272,7 @@ The latency regression misses the 15-minute target at low traffic. It can only b
 - The canary runs the same replica count as stable.
 - Only the current template can be rendered. If someone deletes the old stable Deployment mid-rollout, the rollout stalls instead of recreating it.
 - The analyzer keeps sketches in memory. Run it with NATS so a restart can replay the last hour.
-- The label-free checks will likely miss the subtle 5-point accuracy drop. Delayed labels are planned for that case.
+- A model whose decisions stay very close to the good model's, but are worse, gets past the label-free checks. The `accuracy-drop` variant is caught without labels only because it disagrees on about 7% of requests. For closer regressions, use `labelAccuracy`; how long it takes depends on how quickly labels arrive (see the benchmark).
+- Delayed labels are supported for classification outputs only.
 
 Licensed under Apache 2.0.

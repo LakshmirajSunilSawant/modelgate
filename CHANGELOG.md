@@ -27,11 +27,22 @@ minor versions may change it; such changes are called out below.
 - Release pipeline: multi-arch images, SPDX SBOMs, keyless cosign signatures,
   a vulnerability scan, kubectl plugin binaries, and the Helm chart on GHCR.
 - Apache 2.0 license.
+- Delayed-label accuracy: a `labelAccuracy` check, and an analyzer
+  `POST /v1/outcomes` endpoint that joins ground-truth labels with captured
+  predictions by request ID. Checks can set their own `minSamples`. The
+  benchmark gained a delayed-label mode, and the demo load generator can post
+  labels.
+- `hack/quickstart.sh`: one command from nothing to a running demo on kind,
+  with Prometheus, Grafana, the audit log, traffic and labels. `hack/demo.sh`
+  ships broken or good models and shows the outcome and the audit trail.
+- `kubectl modelgate status -w` refreshes the status every two seconds.
 
 ### Changed
 
 - The NATS sink in the sidecar connects in the background, so a sidecar
   that starts while NATS is down begins publishing once NATS is back.
+- A namespace policy's `minSamples` floor also applies to per-check
+  `minSamples`, except for label checks.
 
 ## [0.1.0]
 

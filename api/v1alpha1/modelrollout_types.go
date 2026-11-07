@@ -77,7 +77,9 @@ type StrategySpec struct {
 // CheckSpec configures one quality check.
 type CheckSpec struct {
 	Name string `json:"name"`
-	// +kubebuilder:validation:Enum=agreementRate;meanAbsDiff;psi;chiSquare;ks;wasserstein;validity;p99Ratio;errorRate
+	// labelAccuracy needs ground-truth labels posted to the analyzer's
+	// /v1/outcomes endpoint; its max is the allowed accuracy drop.
+	// +kubebuilder:validation:Enum=agreementRate;meanAbsDiff;psi;chiSquare;ks;wasserstein;validity;p99Ratio;errorRate;labelAccuracy
 	Type string `json:"type"`
 	// +optional
 	Min *float64 `json:"min,omitempty"`
@@ -87,6 +89,11 @@ type CheckSpec struct {
 	// +kubebuilder:validation:Enum=shadow;canary
 	// +optional
 	Phase string `json:"phase,omitempty"`
+	// Samples this check needs from each version, overriding
+	// analysis.minSamples. labelAccuracy defaults to 200 labeled predictions.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MinSamples *int64 `json:"minSamples,omitempty"`
 }
 
 // AnalysisSpec configures how verdicts are reached.

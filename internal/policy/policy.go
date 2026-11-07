@@ -56,6 +56,18 @@ func Apply(p *mgv1.ModelGatePolicySpec, spec *mgv1.ModelRolloutSpec) Result {
 		res.Tightened = append(res.Tightened, fmt.Sprintf("minSamples %d is below policy minimum %d", a.MinSamples, *p.MinSamples))
 		a.MinSamples = *p.MinSamples
 	}
+	// A per-check minSamples must not undercut the floor either. Label checks
+	// count ground-truth labels, which are far scarcer, so they are exempt.
+	if p.MinSamples != nil {
+		for i := range a.Checks {
+			c := &a.Checks[i]
+			if c.MinSamples != nil && *c.MinSamples < *p.MinSamples && c.Type != analysis.CheckLabelAccuracy {
+				res.Tightened = append(res.Tightened, fmt.Sprintf("check %s minSamples %d is below policy minimum %d", c.Name, *c.MinSamples, *p.MinSamples))
+				v := *p.MinSamples
+				c.MinSamples = &v
+			}
+		}
+	}
 	if p.MaxFailureLimit != nil {
 		limit := a.FailureLimit
 		if limit <= 0 {

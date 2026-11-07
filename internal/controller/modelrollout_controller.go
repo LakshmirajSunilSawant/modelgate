@@ -470,17 +470,19 @@ func (r *ModelRolloutReconciler) analyze(ctx context.Context, mr *mgv1.ModelRoll
 		phase = analysis.PhaseShadow
 	}
 	req := analysis.Request{
-		Rollout:    rolloutKey(mr),
-		Stable:     st.StableRevision,
-		Canary:     st.CanaryRevision,
-		Since:      st.StepStartedAt.Time,
-		Phase:      phase,
-		Look:       int(st.Looks) + 1,
-		MinSamples: mr.Spec.Analysis.MinSamples,
-		Alpha:      mr.Spec.Analysis.Alpha,
+		Rollout: rolloutKey(mr),
+		Stable:  st.StableRevision,
+		Canary:  st.CanaryRevision,
+		Since:   st.StepStartedAt.Time,
+		// labelAccuracy pools labels over the whole rollout.
+		RolloutStart: rolloutStart(st),
+		Phase:        phase,
+		Look:         int(st.Looks) + 1,
+		MinSamples:   mr.Spec.Analysis.MinSamples,
+		Alpha:        mr.Spec.Analysis.Alpha,
 	}
 	for _, c := range mr.Spec.Analysis.Checks {
-		req.Checks = append(req.Checks, analysis.CheckSpec{Name: c.Name, Type: c.Type, Min: c.Min, Max: c.Max, Phase: c.Phase})
+		req.Checks = append(req.Checks, analysis.CheckSpec{Name: c.Name, Type: c.Type, Min: c.Min, Max: c.Max, Phase: c.Phase, MinSamples: c.MinSamples})
 	}
 	v, err := r.Analyzer.Verdict(ctx, req)
 	if err != nil {
@@ -591,6 +593,13 @@ func (r *ModelRolloutReconciler) advance(mr *mgv1.ModelRollout) {
 	st.Message = stageName(mr) + " started"
 	r.Recorder.Eventf(mr, corev1.EventTypeNormal, "StepAdvanced", "%s passed; %s", from, st.Message)
 	r.record(mr, audit.Entry{Action: audit.ActionStepAdvanced, Key: fmt.Sprint(next), Reason: from + " passed", Blocking: true})
+}
+
+func rolloutStart(st *mgv1.ModelRolloutStatus) time.Time {
+	if st.RolloutStartedAt == nil {
+		return time.Time{}
+	}
+	return st.RolloutStartedAt.Time
 }
 
 func actionBy(mr *mgv1.ModelRollout) string {

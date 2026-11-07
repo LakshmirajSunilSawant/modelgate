@@ -79,6 +79,13 @@ spec:
                           type: number
                         min:
                           type: number
+                        minSamples:
+                          description: |-
+                            Samples this check needs from each version, overriding
+                            analysis.minSamples. labelAccuracy defaults to 200 labeled predictions.
+                          format: int64
+                          minimum: 1
+                          type: integer
                         name:
                           type: string
                         phase:
@@ -89,6 +96,9 @@ spec:
                           - canary
                           type: string
                         type:
+                          description: |-
+                            labelAccuracy needs ground-truth labels posted to the analyzer's
+                            /v1/outcomes endpoint; its max is the allowed accuracy drop.
                           enum:
                           - agreementRate
                           - meanAbsDiff
@@ -99,6 +109,7 @@ spec:
                           - validity
                           - p99Ratio
                           - errorRate
+                          - labelAccuracy
                           type: string
                       required:
                       - name

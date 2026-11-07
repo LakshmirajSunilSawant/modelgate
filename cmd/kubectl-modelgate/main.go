@@ -1,6 +1,6 @@
 // Command kubectl-modelgate is a kubectl plugin for manual rollout control:
 //
-//	kubectl modelgate status  <rollout> [-n ns]
+//	kubectl modelgate status  <rollout> [-n ns] [-w]
 //	kubectl modelgate pause   <rollout> [-n ns]
 //	kubectl modelgate resume  <rollout> [-n ns]
 //	kubectl modelgate abort   <rollout> [-n ns]
@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +32,7 @@ import (
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 )
 
-const usage = `usage: kubectl modelgate <status|pause|resume|abort|promote> <rollout> [-n namespace] [--force]`
+const usage = `usage: kubectl modelgate <status|pause|resume|abort|promote> <rollout> [-n namespace] [--force] [-w]`
 
 func main() {
 	if len(os.Args) < 3 {
@@ -41,6 +42,7 @@ func main() {
 	fs := flag.NewFlagSet("modelgate", flag.ExitOnError)
 	ns := fs.String("n", "", "namespace (defaults to the kubeconfig context's)")
 	force := fs.Bool("force", false, "required for promote: skip remaining analysis")
+	watch := fs.Bool("w", false, "status: refresh every 2 seconds until interrupted")
 	_ = fs.Parse(os.Args[3:])
 
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
@@ -62,8 +64,20 @@ func main() {
 	var patch map[string]any
 	switch cmd {
 	case "status":
-		printStatus(mr)
-		return
+		if !*watch {
+			printStatus(mr)
+			return
+		}
+		for {
+			fmt.Print("\033[H\033[2J") // clear the terminal
+			fmt.Printf("%s  (refreshing every 2s, Ctrl-C to stop)\n\n", time.Now().Format("15:04:05"))
+			printStatus(mr)
+			time.Sleep(2 * time.Second)
+			fresh := &mgv1.ModelRollout{}
+			if err := c.Get(ctx, types.NamespacedName{Namespace: *ns, Name: name}, fresh); err == nil {
+				mr = fresh
+			}
+		}
 	case "pause", "resume":
 		patch = map[string]any{
 			"metadata": map[string]any{"annotations": map[string]string{mgv1.ActionByAnnotation: whoami(ctx, cfg)}},

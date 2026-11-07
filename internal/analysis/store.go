@@ -37,7 +37,17 @@ const (
 	maxPending    = 200_000 // unpaired request IDs held for shadow pairing
 	maxSamples    = 25      // disagreement samples kept per rollout
 	maxIDsPerRoll = 2_000   // look counters kept per rollout
+	maxAwaiting   = 200_000 // predictions held per rollout while waiting for a label
 )
+
+// Outcome is a ground-truth label that arrives after the prediction was
+// served, for example a chargeback confirming fraud. It is joined with the
+// captured predictions by request ID.
+type Outcome struct {
+	Rollout   string `json:"rollout"` // "namespace/name"
+	RequestID string `json:"requestId"`
+	Label     string `json:"label"`
+}
 
 // TrackStats aggregates one revision's events within a time range. It is a
 // sketch: memory is bounded regardless of traffic.
@@ -47,8 +57,12 @@ type TrackStats struct {
 	Invalid     int64            `json:"invalid"`
 	Predictions int64            `json:"predictions"` // successful, valid responses
 	Labels      map[string]int64 `json:"labels,omitempty"`
-	Scores      *stats.TDigest   `json:"-"`
-	Latency     *stats.TDigest   `json:"-"`
+	// Labeled predictions whose ground truth has arrived, and how many of
+	// them were correct. Counted in the bucket the prediction was served in.
+	Labeled int64          `json:"labeled"`
+	Correct int64          `json:"correct"`
+	Scores  *stats.TDigest `json:"-"`
+	Latency *stats.TDigest `json:"-"`
 }
 
 func newTrackStats() *TrackStats {
@@ -90,6 +104,8 @@ func (s *TrackStats) merge(o *TrackStats) {
 	s.Errors += o.Errors
 	s.Invalid += o.Invalid
 	s.Predictions += o.Predictions
+	s.Labeled += o.Labeled
+	s.Correct += o.Correct
 	for l, n := range o.Labels {
 		s.addLabel(l, n)
 	}
@@ -138,7 +154,15 @@ type pending struct {
 	seen time.Time
 }
 
+// served is a classification awaiting its ground-truth label.
+type served struct {
+	revision string
+	label    string
+	at       time.Time
+}
+
 type rolloutData struct {
+	awaiting map[string][]served              // request ID -> predictions made for it
 	revs     map[string]map[int64]*TrackStats // revision -> bucket start -> stats
 	pairs    map[pairKey]map[int64]*PairStats
 	pending  map[string]pending // request ID -> first-seen event
@@ -154,6 +178,7 @@ type Store struct {
 	bucket    time.Duration
 	retention time.Duration
 	pairTTL   time.Duration
+	labelTTL  time.Duration
 	now       func() time.Time
 }
 
@@ -162,6 +187,7 @@ type StoreOptions struct {
 	Bucket    time.Duration // default 15s
 	Retention time.Duration // default 3h
 	PairTTL   time.Duration // default 30s
+	LabelTTL  time.Duration // how long a prediction waits for its label; default 1h
 	Now       func() time.Time
 }
 
@@ -176,10 +202,14 @@ func NewStore(o StoreOptions) *Store {
 	if o.PairTTL <= 0 {
 		o.PairTTL = 30 * time.Second
 	}
+	if o.LabelTTL <= 0 {
+		o.LabelTTL = time.Hour
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Store{rollouts: map[string]*rolloutData{}, bucket: o.Bucket, retention: o.Retention, pairTTL: o.PairTTL, now: o.Now}
+	return &Store{rollouts: map[string]*rolloutData{}, bucket: o.Bucket, retention: o.Retention, pairTTL: o.PairTTL,
+		labelTTL: o.LabelTTL, now: o.Now}
 }
 
 // firstBucketFrom returns the first bucket that starts at or after since.
@@ -201,10 +231,11 @@ func (s *Store) rollout(name string) *rolloutData {
 	r, ok := s.rollouts[name]
 	if !ok {
 		r = &rolloutData{
-			revs:    map[string]map[int64]*TrackStats{},
-			pairs:   map[pairKey]map[int64]*PairStats{},
-			pending: map[string]pending{},
-			looks:   map[string]int{},
+			awaiting: map[string][]served{},
+			revs:     map[string]map[int64]*TrackStats{},
+			pairs:    map[pairKey]map[int64]*PairStats{},
+			pending:  map[string]pending{},
+			looks:    map[string]int{},
 		}
 		s.rollouts[name] = r
 	}
@@ -239,7 +270,61 @@ func (s *Store) Ingest(events ...Event) {
 		}
 		ts.add(&e)
 		s.pair(r, &e, now)
+		s.await(r, &e)
 	}
+}
+
+// await keeps a classification until its label arrives or LabelTTL passes.
+func (s *Store) await(r *rolloutData, e *Event) {
+	if e.RequestID == "" || e.Label == nil || e.IsError() || e.Invalid != "" {
+		return
+	}
+	prev, ok := r.awaiting[e.RequestID]
+	if !ok && len(r.awaiting) >= maxAwaiting {
+		return
+	}
+	for _, p := range prev {
+		if p.revision == e.Revision {
+			return // duplicate delivery
+		}
+	}
+	r.awaiting[e.RequestID] = append(prev, served{revision: e.Revision, label: *e.Label, at: e.Time})
+}
+
+// IngestOutcomes joins ground-truth labels with the predictions made for the
+// same requests, and returns how many predictions were scored. Labels for
+// unknown or expired requests are ignored.
+func (s *Store) IngestOutcomes(outcomes ...Outcome) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	scored := 0
+	for _, o := range outcomes {
+		r, ok := s.rollouts[o.Rollout]
+		if !ok || o.RequestID == "" {
+			continue
+		}
+		preds, ok := r.awaiting[o.RequestID]
+		if !ok {
+			continue
+		}
+		delete(r.awaiting, o.RequestID)
+		for _, p := range preds {
+			buckets, ok := r.revs[p.revision]
+			if !ok {
+				continue
+			}
+			ts, ok := buckets[s.bucketOf(p.at)]
+			if !ok {
+				continue // bucket already expired
+			}
+			ts.Labeled++
+			if p.label == o.Label {
+				ts.Correct++
+			}
+			scored++
+		}
+	}
+	return scored
 }
 
 // pair matches a mirrored request with its original by request ID.
@@ -422,6 +507,11 @@ func (s *Store) GC() {
 		for id, p := range r.pending {
 			if now.Sub(p.seen) > s.pairTTL {
 				delete(r.pending, id)
+			}
+		}
+		for id, preds := range r.awaiting {
+			if now.Sub(preds[0].at) > s.labelTTL {
+				delete(r.awaiting, id)
 			}
 		}
 	}
