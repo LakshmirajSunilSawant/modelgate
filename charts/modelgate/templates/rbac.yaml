@@ -72,6 +72,14 @@ rules:
 - apiGroups:
   - modelgate.dev
   resources:
+  - modelgatepolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - modelgate.dev
+  resources:
   - modelrollouts
   verbs:
   - get

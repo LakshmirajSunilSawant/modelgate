@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,19 +22,24 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 	"github.com/modelgate/modelgate/internal/analysis"
+	"github.com/modelgate/modelgate/internal/policy"
 )
 
 const (
 	// KillSwitchKey in the kill-switch ConfigMap freezes every rollout when "true".
-	KillSwitchKey       = "freeze"
-	templateHashAnnot   = "modelgate.dev/template-hash"
-	defaultInterval     = 30 * time.Second
-	waitForPodsInterval = 10 * time.Second
+	KillSwitchKey     = "freeze"
+	templateHashAnnot = "modelgate.dev/template-hash"
+	// ConditionPolicyApplied reports how the namespace ModelGatePolicy changed the rollout.
+	ConditionPolicyApplied = "PolicyApplied"
+	defaultInterval        = 30 * time.Second
+	waitForPodsInterval    = 10 * time.Second
 )
 
 // ModelRolloutReconciler reconciles ModelRollout objects.
@@ -52,6 +58,7 @@ type ModelRolloutReconciler struct {
 
 // +kubebuilder:rbac:groups=modelgate.dev,resources=modelrollouts,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=modelgate.dev,resources=modelrollouts/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=modelgate.dev,resources=modelgatepolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;update;patch
@@ -76,9 +83,15 @@ func (r *ModelRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Phase 1: transitions driven by the spec and manual actions.
 	before := mr.Status.DeepCopy()
+	// The namespace policy is merged into the in-memory spec before anything
+	// reads it. The spec is never written back, only status and annotations.
+	pol, err := r.applyPolicy(ctx, mr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	r.applySpec(mr, rev)
 	action := r.applyAction(mr)
-	if err := r.saveStatus(ctx, mr, before); err != nil {
+	if err := r.saveStatus(ctx, mr, before, pol); err != nil {
 		return ctrl.Result{}, err
 	}
 	if action != "" {
@@ -87,13 +100,14 @@ func (r *ModelRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.Patch(ctx, mr, patch); err != nil {
 			return ctrl.Result{}, err
 		}
+		policy.Apply(pol, &mr.Spec) // the patch response carries the stored spec
 	}
 
 	// Converge resources to what status says.
 	if err := r.converge(ctx, mr, rev); err != nil {
 		before = mr.Status.DeepCopy()
 		setCondition(mr, mgv1.ConditionStalled, metav1.ConditionTrue, "ConvergeFailed", err.Error())
-		_ = r.saveStatus(ctx, mr, before)
+		_ = r.saveStatus(ctx, mr, before, pol)
 		return ctrl.Result{}, err
 	}
 
@@ -102,7 +116,7 @@ func (r *ModelRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	result := r.analyze(ctx, mr)
 	r.setReadiness(mr)
 	recordMetrics(mr)
-	if err := r.saveStatus(ctx, mr, before); err != nil {
+	if err := r.saveStatus(ctx, mr, before, pol); err != nil {
 		return ctrl.Result{}, err
 	}
 	if before.StableRevision != mr.Status.StableRevision || before.CanaryRevision != mr.Status.CanaryRevision ||
@@ -121,12 +135,16 @@ func (r *ModelRolloutReconciler) now() time.Time {
 	return time.Now()
 }
 
-func (r *ModelRolloutReconciler) saveStatus(ctx context.Context, mr *mgv1.ModelRollout, before *mgv1.ModelRolloutStatus) error {
+// saveStatus writes status if it changed. The update response carries the
+// stored spec, so the namespace policy is merged in again afterwards.
+func (r *ModelRolloutReconciler) saveStatus(ctx context.Context, mr *mgv1.ModelRollout, before *mgv1.ModelRolloutStatus, pol *mgv1.ModelGatePolicySpec) error {
 	mr.Status.ObservedGeneration = mr.Generation
 	if equality.Semantic.DeepEqual(*before, mr.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, mr)
+	err := r.Status().Update(ctx, mr)
+	policy.Apply(pol, &mr.Spec)
+	return err
 }
 
 // applySpec handles first deploys, new templates, and reverted templates.
@@ -602,6 +620,43 @@ func (r *ModelRolloutReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mgv1.ModelRollout{}).
 		Owns(&appsv1.Deployment{}).
+		Watches(&mgv1.ModelGatePolicy{}, handler.EnqueueRequestsFromMapFunc(r.rolloutsInNamespace)).
 		Named("modelrollout").
 		Complete(r)
+}
+
+// rolloutsInNamespace re-reconciles every rollout when its namespace policy changes.
+func (r *ModelRolloutReconciler) rolloutsInNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list mgv1.ModelRolloutList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for _, mr := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&mr)})
+	}
+	return reqs
+}
+
+// applyPolicy raises the rollout's analysis and strategy to the namespace
+// ModelGatePolicy. If the policy cannot be read the reconcile fails and is
+// retried: a rollout never proceeds on thresholds that might be too loose.
+func (r *ModelRolloutReconciler) applyPolicy(ctx context.Context, mr *mgv1.ModelRollout) (*mgv1.ModelGatePolicySpec, error) {
+	pol := &mgv1.ModelGatePolicy{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: mr.Namespace, Name: mgv1.PolicyName}, pol)
+	if apierrors.IsNotFound(err) {
+		meta.RemoveStatusCondition(&mr.Status.Conditions, ConditionPolicyApplied)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading namespace policy: %w", err)
+	}
+	res := policy.Apply(&pol.Spec, &mr.Spec)
+	reason, msg := "Compliant", "rollout meets the namespace policy"
+	if res.Changed() {
+		reason = "Tightened"
+		msg = "raised to namespace policy: " + strings.Join(append(res.Tightened, res.Added...), "; ")
+	}
+	setCondition(mr, ConditionPolicyApplied, metav1.ConditionTrue, reason, msg)
+	return &pol.Spec, nil
 }

@@ -25,3 +25,9 @@ nats:
 # Set to "true" to freeze every rollout in the cluster at its current weight.
 killSwitch:
   freeze: "false"
+
+# Validating webhook that rejects ModelRollouts looser than their namespace
+# ModelGatePolicy. The controller enforces policies either way.
+webhook:
+  enabled: true
+  failurePolicy: Ignore

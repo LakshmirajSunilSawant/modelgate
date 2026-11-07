@@ -1,0 +1,19 @@
+# Namespace-wide quality-gate floor, set once by the platform team. Every
+# ModelRollout in the namespace gets these checks; a rollout may set a
+# stricter threshold but never a looser one. The controller enforces this at
+# runtime and the validating webhook rejects looser rollouts at apply time.
+apiVersion: modelgate.dev/v1alpha1
+kind: ModelGatePolicy
+metadata:
+  name: default          # the only allowed name: one policy per namespace
+  namespace: demo
+spec:
+  minSamples: 2000
+  maxFailureLimit: 2
+  maxAlpha: 0.01
+  maxFirstStepWeight: 5
+  checks:
+    - { name: agreement, type: agreementRate, min: 0.97, phase: shadow }
+    - { name: valid,     type: validity,      max: 0 }
+    - { name: errors,    type: errorRate,     max: 0.01 }
+    - { name: latency,   type: p99Ratio,      max: 1.2 }

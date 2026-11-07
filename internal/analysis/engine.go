@@ -210,6 +210,30 @@ func (c *checkCtx) run(s CheckSpec) CheckResult {
 	return r
 }
 
+// defaultThresholds apply when a check sets none.
+var defaultThresholds = map[string]float64{
+	CheckAgreementRate: 0.97,
+	CheckMeanAbsDiff:   0.05,
+	CheckPSI:           0.1,
+	CheckChiSquare:     0.1,
+	CheckKS:            0.1,
+	CheckWasserstein:   0.05,
+	CheckValidity:      0,
+	CheckErrorRate:     0.01,
+	CheckP99Ratio:      1.2,
+}
+
+// DefaultThreshold returns the threshold a check of this type uses when
+// none is set, and whether the type is known.
+func DefaultThreshold(checkType string) (float64, bool) {
+	v, ok := defaultThresholds[checkType]
+	return v, ok
+}
+
+// HigherIsStricter reports whether raising the threshold makes the check
+// stricter. Only agreementRate has a minimum; every other check has a maximum.
+func HigherIsStricter(checkType string) bool { return checkType == CheckAgreementRate }
+
 func threshold(p *float64, def float64) float64 {
 	if p != nil {
 		return *p
@@ -234,7 +258,7 @@ func (c *checkCtx) comparativeN() int64 {
 // agreementRate fails when the upper confidence bound of the agreement rate
 // is below min: the canary confidently flips more decisions than allowed.
 func (c *checkCtx) agreement(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Min, 0.97)
+	r.Threshold = threshold(s.Min, defaultThresholds[s.Type])
 	if c.req.Phase != PhaseShadow {
 		r.Status = Skipped
 		r.Message = fmt.Sprintf("%s: needs shadow traffic", s.Name)
@@ -259,7 +283,7 @@ func (c *checkCtx) agreement(s CheckSpec, r *CheckResult) {
 // exceeds max. Scores are not assumed bounded, so this uses a normal
 // approximation with alpha spending.
 func (c *checkCtx) meanAbsDiff(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 0.05)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	if c.req.Phase != PhaseShadow {
 		r.Status = Skipped
 		r.Message = fmt.Sprintf("%s: needs shadow traffic", s.Name)
@@ -332,7 +356,7 @@ func (c *checkCtx) categories() (st, ca []float64, kind string) {
 // psi fails when PSI exceeds max and a chi-square test (alpha-spent) confirms
 // the shift is not sampling noise.
 func (c *checkCtx) psi(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 0.1)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	if !c.enough(r, c.comparativeN()) {
 		return
 	}
@@ -387,7 +411,7 @@ func mergeKeys(a, b map[string]int64) map[string]struct{} {
 // chiSquare fails when the class mix differs significantly (alpha-spent) and
 // Cramér's V exceeds max, so huge samples do not fail on trivial shifts.
 func (c *checkCtx) chiSquare(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 0.1)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	if !c.enough(r, c.comparativeN()) {
 		return
 	}
@@ -412,7 +436,7 @@ func (c *checkCtx) chiSquare(s CheckSpec, r *CheckResult) {
 // allowing for sampling error in both CDFs, the distributions differ by more
 // than the threshold.
 func (c *checkCtx) ks(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 0.1)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	if !c.enough(r, c.comparativeN()) {
 		return
 	}
@@ -436,7 +460,7 @@ func (c *checkCtx) ks(s CheckSpec, r *CheckResult) {
 // wasserstein fails when the distance exceeds max and the KS test rejects
 // equality of the two distributions at the spent alpha.
 func (c *checkCtx) wasserstein(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 0.05)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	if !c.enough(r, c.comparativeN()) {
 		return
 	}
@@ -462,7 +486,7 @@ func (c *checkCtx) wasserstein(s CheckSpec, r *CheckResult) {
 // prediction is unusable. With max 0 (the default) any invalid output fails.
 func (c *checkCtx) validity(s CheckSpec, r *CheckResult) {
 	r.Hard = true
-	r.Threshold = threshold(s.Max, 0)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	n := c.canary.Predictions + c.canary.Invalid
 	r.Samples = n
 	if n == 0 {
@@ -489,7 +513,7 @@ func (c *checkCtx) validity(s CheckSpec, r *CheckResult) {
 // of the canary error rate exceeds max.
 func (c *checkCtx) errorRate(s CheckSpec, r *CheckResult) {
 	r.Hard = true
-	r.Threshold = threshold(s.Max, 0.01)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	n := c.canary.Requests
 	r.Samples = n
 	if n == 0 {
@@ -523,7 +547,7 @@ func ratio(a, b int64) float64 {
 // p99Ratio fails when a conservative ratio, the canary's lower-band p99 over
 // the stable's upper-band p99, exceeds max.
 func (c *checkCtx) p99Ratio(s CheckSpec, r *CheckResult) {
-	r.Threshold = threshold(s.Max, 1.2)
+	r.Threshold = threshold(s.Max, defaultThresholds[s.Type])
 	n := min(c.stable.Requests, c.canary.Requests)
 	if !c.enough(r, n) {
 		return

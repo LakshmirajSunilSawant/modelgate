@@ -1,0 +1,25 @@
+# ValidatingWebhookConfiguration for the ModelRollout policy check. The Helm
+# chart renders the same webhook with its service and CA bundle; this copy is
+# what envtest installs.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: modelgate-validating-webhook
+webhooks:
+  - name: vmodelrollout.modelgate.dev
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # The controller enforces the namespace policy at runtime, so an
+    # unavailable webhook only loses early feedback, never safety.
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: modelgate-webhook
+        namespace: modelgate-system
+        path: /validate-modelgate-dev-v1alpha1-modelrollout
+    rules:
+      - apiGroups: ["modelgate.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["modelrollouts"]

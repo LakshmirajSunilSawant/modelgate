@@ -324,6 +324,49 @@ func TestCaptureChangeReachesBothDeployments(t *testing.T) {
 	}
 }
 
+func TestNamespacePolicyIsEnforced(t *testing.T) {
+	e := newEnv(t)
+	loose, strict := 0.5, 0.01
+	e.update(func(mr *mgv1.ModelRollout) {
+		mr.Spec.Analysis.Checks = append(mr.Spec.Analysis.Checks, mgv1.CheckSpec{Name: "errors", Type: "errorRate", Max: &loose})
+	})
+	pol := &mgv1.ModelGatePolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ml", Name: mgv1.PolicyName},
+		Spec: mgv1.ModelGatePolicySpec{
+			Checks:             []mgv1.CheckSpec{{Name: "errors", Type: "errorRate", Max: &strict}, {Name: "valid", Type: "validity"}},
+			MaxFirstStepWeight: ptr(int32(2)),
+		},
+	}
+	if err := e.c.Create(context.Background(), pol); err != nil {
+		t.Fatal(err)
+	}
+	e.startRollout()
+	e.reconcile()
+	req := e.an.calls[len(e.an.calls)-1]
+	got := map[string]analysis.CheckSpec{}
+	for _, c := range req.Checks {
+		got[c.Name] = c
+	}
+	if c := got["errors"]; c.Max == nil || *c.Max != strict {
+		t.Errorf("errorRate threshold sent to analyzer: %+v", c)
+	}
+	if _, ok := got["policy-valid"]; !ok {
+		t.Errorf("required check missing from analysis: %+v", req.Checks)
+	}
+	mr := e.get()
+	if c := findCondition(mr, ConditionPolicyApplied); c == nil || c.Reason != "Tightened" {
+		t.Errorf("PolicyApplied condition: %+v", c)
+	}
+	if v := *mr.Spec.Analysis.Checks[len(mr.Spec.Analysis.Checks)-1].Max; v != loose {
+		t.Errorf("policy was written back into the stored spec (max %v)", v)
+	}
+	e.clock = e.clock.Add(11 * time.Minute)
+	e.reconcile()
+	if _, c, _ := e.weights(); c != 2 {
+		t.Errorf("first step weight %d, want policy cap 2", c)
+	}
+}
+
 func TestAnalyzerDownHoldsAndNeverPromotes(t *testing.T) {
 	e := newEnv(t)
 	e.startRollout()

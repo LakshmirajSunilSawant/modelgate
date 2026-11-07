@@ -12,10 +12,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 	"github.com/modelgate/modelgate/internal/controller"
+	mgwebhook "github.com/modelgate/modelgate/internal/webhook"
 )
 
 func main() {
@@ -29,6 +31,9 @@ func main() {
 		killSwitchNS  = flag.String("kill-switch-namespace", "modelgate-system", "namespace of the kill-switch ConfigMap")
 		killSwitchCM  = flag.String("kill-switch-configmap", "modelgate-config", "name of the kill-switch ConfigMap")
 		sidecarIngest = flag.String("sidecar-analyzer-url", "", "analyzer URL as seen from model pods (defaults to --analyzer-url)")
+		webhooks      = flag.Bool("enable-webhooks", false, "serve the ModelRollout validating webhook")
+		webhookPort   = flag.Int("webhook-port", 9443, "webhook server port")
+		webhookCerts  = flag.String("webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "directory with tls.crt and tls.key")
 	)
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -48,6 +53,7 @@ func main() {
 		LeaderElection:                *leaderElect,
 		LeaderElectionID:              "modelgate-controller.modelgate.dev",
 		LeaderElectionReleaseOnCancel: true,
+		WebhookServer:                 webhook.NewServer(webhook.Options{Port: *webhookPort, CertDir: *webhookCerts}),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -70,6 +76,12 @@ func main() {
 	if err := r.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)
+	}
+	if *webhooks {
+		if err := mgwebhook.Setup(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook")
+			os.Exit(1)
+		}
 	}
 	must(mgr.AddHealthzCheck("healthz", healthz.Ping))
 	must(mgr.AddReadyzCheck("readyz", healthz.Ping))

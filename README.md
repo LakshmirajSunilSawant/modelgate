@@ -18,7 +18,8 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | `kubectl modelgate` plugin (status/pause/resume/abort/promote --force) with identity | done |
 | Helm chart, Dockerfiles, CI | done; installed and exercised on kind with Envoy Gateway |
 | Demo model with the PRD's six bad variants | done |
-| Postgres audit log, namespace default thresholds + validating webhook, Grafana dashboard | **not yet** |
+| Namespace defaults (`ModelGatePolicy`) enforced at runtime + validating webhook | done; envtest and live on kind |
+| Postgres audit log, Grafana dashboard | **not yet** |
 | Delayed-label accuracy, replay mode, KServe/gRPC | **not yet** (post-v0.1) |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
 | kind e2e in CI, Chaos Mesh tests, cosign/SBOM | **not yet** (resilience was checked by hand on kind) |
@@ -97,6 +98,13 @@ kubectl modelgate status demo-model -n demo
 
 > Helm does not upgrade CRDs in `crds/`. After changing the CRD run `kubectl apply --server-side -f config/crd/`; it is too large for client-side apply. Shadow sampling uses the Gateway API `RequestMirror.percent` field, which is in the experimental channel. With standard-channel CRDs, mirroring falls back to 100%.
 
+## Namespace policy
+
+Platform teams set a floor once per namespace with a `ModelGatePolicy` named `default` ([config/samples/policy.yaml](config/samples/policy.yaml)). Teams may tighten it, never loosen it.
+
+- **The controller is the guard.** Every reconcile merges the policy into the rollout in memory, taking the stricter threshold for each check type and phase. Required checks the rollout doesn't declare are added as `policy-<name>`. The policy also sets a floor on `minSamples` and caps `failureLimit`, `alpha` and the first step's weight. The stored spec is never rewritten. The `PolicyApplied` condition says what was raised. If the policy can't be read, the rollout doesn't proceed.
+- **The webhook gives feedback.** It rejects a create or spec update that is looser than the policy and names every offending field. Metadata-only updates always pass, so `kubectl modelgate abort` keeps working on rollouts that predate a stricter policy. It fails open (`failurePolicy: Ignore`), because runtime enforcement covers safety. The Helm chart generates its TLS certificate at install time and reuses it on upgrade; cert-manager is not needed.
+
 ## Manual control
 
 ```sh
@@ -125,6 +133,8 @@ internal/analysis/     time-bucketed per-revision sketches, shadow pairing, chec
 internal/analyzer/     HTTP API, Argo/Flagger adapters, NATS consumer, metrics
 internal/capture/      sidecar proxy, JSONPath subset, batching publisher (HTTP/NATS)
 internal/controller/   reconciler, Deployment/Service/HTTPRoute rendering, metrics
+internal/policy/       ModelGatePolicy merge (teams may only tighten)
+internal/webhook/      validating webhook for ModelRollouts
 cmd/                   manager, analyzer, sidecar, kubectl-modelgate
 charts/modelgate/      Helm chart
 demo/model/            FastAPI + scikit-learn demo model, bad variants, load generator
@@ -142,6 +152,7 @@ make loadtest   # sidecar overhead at 1,000 req/s
 ```
 
 - **Unit:** sketch accuracy and bound coverage under repeated looks. 50 simulated identical-model rollouts stay under 2% false rollbacks, and each bad variant must fail on the expected check. Controller logic runs against a fake client.
+- **envtest:** the webhook behind a real API server. A loose rollout is rejected with a reason, a compliant one is accepted, annotation-only updates pass after the policy tightens, and a second policy name is refused.
 - **envtest:** the generated CRD schema, CEL rules, defaults, pod-template metadata, the status subresource, and the experimental mirror field are all enforced by a real API server. It also drives a full rollout: deploy, shadow, three steps, promote, then a bad canary rolled back.
 - **Local smoke:** all 8 demo variants through the real binaries. `good` and `identical` pass; the 6 bad variants fail.
 - **kind + Envoy Gateway:** tested by hand.
@@ -149,6 +160,7 @@ make loadtest   # sidecar overhead at 1,000 req/s
   - `swapped` and `nan` roll back in shadow with zero user exposure; `slow` rolls back at 5%.
   - Analyzer down for 80 s: the rollout holds, then resumes.
   - Leader controller killed mid-step: the standby takes over and finishes.
+  - Namespace policy: the webhook rejects a looser spec, the runtime condition lists what was raised, and a 3% first-step cap reaches the HTTPRoute (97/3).
   - The kill switch freezes rollouts; the plugin's pause, resume, abort and promote guard all work, and an abort records `kubernetes-admin`.
 
 ### Benchmark results

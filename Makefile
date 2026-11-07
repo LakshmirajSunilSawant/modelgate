@@ -13,7 +13,7 @@ generate:
 manifests:
 	$(CONTROLLER_GEN) crd:allowDangerousTypes=true,generateEmbeddedObjectMeta=true paths=./api/v1alpha1 output:crd:artifacts:config=config/crd
 	$(CONTROLLER_GEN) rbac:roleName=modelgate-controller paths=./internal/controller output:rbac:artifacts:config=config/rbac
-	cp config/crd/modelgate.dev_modelrollouts.yaml charts/modelgate/crds/
+	cp config/crd/*.yaml charts/modelgate/crds/
 
 test:
 	go vet ./...
@@ -22,7 +22,7 @@ test:
 ENVTEST_K8S_VERSION ?= 1.33.0
 envtest:
 	go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21
-	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) -p path)" go test ./internal/controller/ -run Envtest -v
+	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) -p path)" go test ./internal/controller/ ./internal/webhook/ -run "Envtest|Webhook" -v
 
 bench:
 	python demo/model/export_pool.py --out bench/pool.json

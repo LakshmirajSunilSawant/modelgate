@@ -31,9 +31,13 @@ spec:
             {{- with .Values.nats.url }}
             - --nats-url={{ . }}
             {{- end }}
+            {{- if .Values.webhook.enabled }}
+            - --enable-webhooks=true
+            {{- end }}
           ports:
             - { name: metrics, containerPort: 8080 }
             - { name: probes, containerPort: 8081 }
+            - { name: webhook, containerPort: 9443 }
           livenessProbe: { httpGet: { path: /healthz, port: probes } }
           readinessProbe: { httpGet: { path: /readyz, port: probes } }
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
@@ -41,3 +45,10 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
+          {{- if .Values.webhook.enabled }}
+          volumeMounts:
+            - { name: webhook-certs, mountPath: /tmp/k8s-webhook-server/serving-certs, readOnly: true }
+      volumes:
+        - name: webhook-certs
+          secret: { secretName: modelgate-webhook-tls }
+          {{- end }}

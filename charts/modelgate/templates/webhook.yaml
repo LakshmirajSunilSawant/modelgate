@@ -1,0 +1,68 @@
+{{- if .Values.webhook.enabled }}
+{{- /*
+Self-signed serving certificate for the validating webhook, created at
+install time and reused on upgrade so the CA bundle stays valid.
+*/ -}}
+{{- $svc := "modelgate-webhook" }}
+{{- $dns := printf "%s.%s.svc" $svc .Release.Namespace }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace "modelgate-webhook-tls" }}
+{{- $crt := "" }}{{- $key := "" }}{{- $ca := "" }}
+{{- if and $existing $existing.data (index $existing.data "ca.crt") }}
+{{- $crt = index $existing.data "tls.crt" }}
+{{- $key = index $existing.data "tls.key" }}
+{{- $ca = index $existing.data "ca.crt" }}
+{{- else }}
+{{- $caCert := genCA "modelgate-webhook-ca" 3650 }}
+{{- $cert := genSignedCert $dns nil (list $dns (printf "%s.%s" $svc .Release.Namespace) $svc) 3650 $caCert }}
+{{- $crt = $cert.Cert | b64enc }}
+{{- $key = $cert.Key | b64enc }}
+{{- $ca = $caCert.Cert | b64enc }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modelgate-webhook-tls
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $crt }}
+  tls.key: {{ $key }}
+  ca.crt: {{ $ca }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: modelgate-controller }
+  ports:
+    - { name: webhook, port: 443, targetPort: webhook }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: modelgate-validating-webhook
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+webhooks:
+  - name: vmodelrollout.modelgate.dev
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # The controller enforces namespace policies at runtime, so an
+    # unavailable webhook only loses early feedback, never safety.
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    timeoutSeconds: 5
+    clientConfig:
+      caBundle: {{ $ca }}
+      service:
+        name: {{ $svc }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-modelgate-dev-v1alpha1-modelrollout
+    rules:
+      - apiGroups: ["modelgate.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["modelrollouts"]
+{{- end }}
