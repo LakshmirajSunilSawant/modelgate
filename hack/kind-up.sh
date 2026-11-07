@@ -2,7 +2,9 @@
 # Creates a kind cluster with Envoy Gateway as the Gateway API implementation.
 set -euo pipefail
 CLUSTER="${1:-modelgate}"
-EG_VERSION="${EG_VERSION:-v1.4.0}"
+# v1.8.0 or later: earlier releases reject GRPCRoute RequestMirror filters
+# (envoyproxy/gateway#8541), which shadow mode needs for gRPC models.
+EG_VERSION="${EG_VERSION:-v1.9.3}"
 
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
 
