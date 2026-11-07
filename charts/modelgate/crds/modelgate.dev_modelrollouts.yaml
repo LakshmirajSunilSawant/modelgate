@@ -248,6 +248,39 @@ spec:
                 description: StrategySpec is the sequence of stages a rollout goes
                   through.
                 properties:
+                  replay:
+                    description: Replay recorded requests during every analysis stage.
+                    properties:
+                      configMapRef:
+                        description: |-
+                          ConfigMap in the rollout's namespace with the recorded requests: one
+                          JSON request body per line. Empty lines are skipped.
+                        properties:
+                          key:
+                            default: requests.jsonl
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      path:
+                        default: /
+                        description: HTTP path the requests are POSTed to, such as
+                          /predict.
+                        pattern: ^/
+                        type: string
+                      ratePerSecond:
+                        default: 5
+                        description: Recorded requests sent per second, each to both
+                          versions.
+                        format: int32
+                        maximum: 200
+                        minimum: 1
+                        type: integer
+                    required:
+                    - configMapRef
+                    type: object
                   shadow:
                     description: |-
                       ShadowSpec mirrors live traffic to the canary without exposing its

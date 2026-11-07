@@ -23,7 +23,8 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | Grafana dashboard (Helm ConfigMap for the Grafana sidecar) | done |
 | Delayed-label accuracy (`labelAccuracy` check, `/v1/outcomes` API) | done; unit, benchmark, live on kind |
 | Opt-in, time-limited payload capture with redaction in the sidecar | done; unit and controller tests |
-| Replay mode, KServe/gRPC | **not yet** (post-v0.1) |
+| Replay of recorded requests for low-traffic models | done; unit, envtest, and kind e2e with no live traffic |
+| KServe/gRPC | **not yet** (post-v0.1) |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
 | kind e2e in CI (NATS, Postgres, Envoy Gateway), Chaos Mesh run | done; see [hack/e2e/run.sh](hack/e2e/run.sh) |
 | Release: multi-arch images, SBOMs, cosign signatures, vulnerability scans | done; [release workflow](.github/workflows/release.yaml), not yet run on a tag |
@@ -177,6 +178,32 @@ kubectl modelgate payloads demo-model -n demo --request-id 4f1c  # stable and ca
 - **Where it goes:** payloads travel with the events to the analyzer, which keeps the last 500 per rollout for an hour in memory and serves them at `GET /v1/payloads?rollout=ns/name[&requestId=...]`. With NATS, events, including payloads, are also stored in the JetStream stream for an hour. The plugin reads them through the API server's service proxy, so it needs `services/proxy` on `modelgate-analyzer` in `modelgate-system`. The analyzer API itself has no authentication; restrict it with a NetworkPolicy if other workloads share the cluster.
 - **Namespace policy:** `spec.payloadCapture.disabled: true` in the `ModelGatePolicy` forbids capture in the namespace, and `spec.payloadCapture.redact` adds paths every rollout must redact.
 
+## Replay for low-traffic models
+
+A model that serves a few requests a minute may never reach `minSamples` on live traffic, so its rollouts hold forever. Replay sends recorded requests to both versions while a canary is under analysis:
+
+```yaml
+spec:
+  strategy:
+    shadow: { duration: 10m }
+    replay:
+      configMapRef: { name: fraud-replay, key: requests.jsonl }  # key defaults to requests.jsonl
+      path: /predict          # where requests are POSTed, default /
+      ratePerSecond: 20       # recorded requests per second, default 5, at most 200
+```
+
+The ConfigMap holds one JSON request body per line. To record real traffic, turn on [payload capture](#payload-capture-for-debugging) for a while and export the captured requests:
+
+```sh
+kubectl modelgate payloads fraud -n ml --limit 500 --requests > requests.jsonl
+kubectl -n ml create configmap fraud-replay --from-file=requests.jsonl
+```
+
+- **Same request, both versions.** Each recorded request goes to the stable and canary Services with the same new request ID, so the analyzer pairs the two responses like mirrored traffic, and `agreementRate` and `meanAbsDiff` work with no live traffic at all. IDs are picked so the sidecars' `capture.sampleRate` keeps every replayed request.
+- **Users never see replayed responses.** The controller sends them straight to the Services, not through the HTTPRoute. It cycles through the file for as long as the canary is under analysis, and stops when the rollout is paused, held by the kill switch or a missing analyzer, promoted or rolled back.
+- **It adds load to stable.** Every replayed request also runs on the production model; size `ratePerSecond` for that. Exported requests are redacted, so a field your model needs must not be in the redact list, or the replayed predictions will differ from production.
+- **Status:** the `Replay` condition says how many requests were loaded, or why replay is off (`ConfigMapNotFound`, `KeyNotFound`, `InvalidRequests`). `modelgate_replay_requests_total{target,outcome}` on the controller counts what was sent. The controller needs network access to the model Services; allow it if a NetworkPolicy restricts them.
+
 ## Audit log
 
 Set `audit.existingSecret` in the Helm chart to a Secret holding a PostgreSQL DSN (key `dsn`), and the controller records every decision in table `modelgate_audit`, which it creates on first use. A demo database for kind is in [config/samples/postgres.yaml](config/samples/postgres.yaml).
@@ -245,6 +272,7 @@ make bench      # bad-model suite, 50 runs per variant
 make loadtest   # sidecar overhead at 1,000 req/s
 make e2e        # kind: NATS, Postgres, Envoy Gateway, real rollouts under load
 make e2e-chaos  # the same while Chaos Mesh kills the controller, analyzer and NATS
+make e2e-replay # no live traffic: replayed requests alone must promote and roll back
 make vulncheck  # govulncheck on the module
 ```
 
@@ -253,7 +281,7 @@ make vulncheck  # govulncheck on the module
 - **envtest:** the generated CRD schema, CEL rules, defaults, pod-template metadata, the status subresource, and the experimental mirror field are all enforced by a real API server. It also drives a full rollout: deploy, shadow, three steps, promote, then a bad canary rolled back.
 - **Local smoke:** all 8 demo variants through the real binaries. `good` and `identical` pass; the 6 bad variants fail.
 - **Audit:** controller tests check the recorded sequence for a full rollout, the actors for pause, resume and abort, and fail-safe behavior with the database down (holds, never promotes, still rolls back, a forced promote waits and is recorded once). `internal/audit` runs against a real PostgreSQL when `MODELGATE_TEST_POSTGRES_DSN` is set; CI runs it with a Postgres service container.
-- **kind e2e (CI):** `hack/e2e/run.sh` installs everything with NATS JetStream and the audit log, sends load through Envoy Gateway, and runs rollouts of demo variants. Good variants must promote and bad ones must roll back; a bad variant ever becoming stable fails the run at once. It then checks the audit log against the outcomes. The CI chaos job runs the same suite while Chaos Mesh kills a controller replica every 40 s, the analyzer every 90 s, and NATS every 150 s. `CHAOS=kubectl` does the same kills without Chaos Mesh.
+- **kind e2e (CI):** `hack/e2e/run.sh` installs everything with NATS JetStream and the audit log, sends load through Envoy Gateway, and runs rollouts of demo variants. Good variants must promote and bad ones must roll back; a bad variant ever becoming stable fails the run at once. It then checks the audit log against the outcomes. The CI chaos job runs the same suite while Chaos Mesh kills a controller replica every 40 s, the analyzer every 90 s, and NATS every 150 s. `CHAOS=kubectl` does the same kills without Chaos Mesh. The CI replay job sends no live traffic at all, so `identical` must promote and `swapped` must roll back on replayed requests alone.
 - **kind + Envoy Gateway:** tested by hand.
   - A good rollout promotes through every stage.
   - `swapped` and `nan` roll back in shadow with zero user exposure; `slow` rolls back at 5%.

@@ -1,6 +1,7 @@
 # End-to-end tests on kind: real Envoy Gateway, NATS JetStream, PostgreSQL
 # audit log, and the demo model under load. The chaos job adds Chaos Mesh
-# pod kills of the controller, analyzer and NATS during every rollout.
+# pod kills of the controller, analyzer and NATS during every rollout. The
+# replay job sends no live traffic, so only replayed requests feed analysis.
 name: e2e
 on:
   push: { branches: [main] }
@@ -25,6 +26,11 @@ jobs:
           - name: chaos
             chaos: mesh
             scenarios: "swapped:rollback identical:promote scaling:rollback good:promote"
+          - name: replay
+            chaos: "off"
+            rps: "0"
+            replay: "1"
+            scenarios: "identical:promote swapped:rollback"
     name: e2e (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +44,8 @@ jobs:
         env:
           CHAOS: ${{ matrix.chaos }}
           SCENARIOS: ${{ matrix.scenarios }}
+          RPS: ${{ matrix.rps || '50' }}
+          REPLAY: ${{ matrix.replay || '0' }}
           TIMEOUT: "1200"
         run: bash hack/e2e/run.sh
       - if: always()

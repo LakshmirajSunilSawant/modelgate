@@ -9,6 +9,12 @@ minor versions may change it; such changes are called out below.
 
 ### Added
 
+- Replay for low-traffic models (`spec.strategy.replay`). While a canary is
+  under analysis, the controller sends recorded requests from a ConfigMap to
+  both the stable and canary Services with the same request ID, so they pair
+  like mirrored traffic. It stops whenever the rollout is held. The `Replay`
+  condition reports how many requests were loaded or why replay is off.
+  `kubectl modelgate payloads --requests` exports captured requests for it.
 - Opt-in raw payload capture for debugging (`spec.capture.payloads`). It is
   time-limited (`until`, at most 24 hours ahead), redacts JSONPath fields in
   the sidecar before anything leaves the pod, captures only JSON bodies, and

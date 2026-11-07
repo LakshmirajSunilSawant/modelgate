@@ -65,6 +65,37 @@ type Step struct {
 	Pause  metav1.Duration `json:"pause"`
 }
 
+// ReplaySpec sends recorded requests to both stable and canary while a
+// canary is under analysis, so models with little live traffic still reach
+// minSamples. Each recorded request goes to both versions with the same
+// request ID, so the responses pair like mirrored traffic. Replayed requests
+// reach the models directly through their Services, never through the
+// HTTPRoute, so users never see a replayed response.
+type ReplaySpec struct {
+	// ConfigMap in the rollout's namespace with the recorded requests: one
+	// JSON request body per line. Empty lines are skipped.
+	ConfigMapRef ConfigMapKeyRef `json:"configMapRef"`
+	// HTTP path the requests are POSTed to, such as /predict.
+	// +kubebuilder:validation:Pattern=`^/`
+	// +kubebuilder:default="/"
+	// +optional
+	Path string `json:"path,omitempty"`
+	// Recorded requests sent per second, each to both versions.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=200
+	// +kubebuilder:default=5
+	// +optional
+	RatePerSecond int32 `json:"ratePerSecond,omitempty"`
+}
+
+// ConfigMapKeyRef names one key of a ConfigMap in the rollout's namespace.
+type ConfigMapKeyRef struct {
+	Name string `json:"name"`
+	// +kubebuilder:default="requests.jsonl"
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
 // StrategySpec is the sequence of stages a rollout goes through.
 // +kubebuilder:validation:XValidation:rule="size(self.steps) == 0 || self.steps[0].weight <= 50",message="the first step may send at most 50% of traffic to the canary"
 // +kubebuilder:validation:XValidation:rule="has(self.shadow) || size(self.steps) > 0",message="at least one of shadow or steps is required"
@@ -74,6 +105,9 @@ type StrategySpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	Steps []Step `json:"steps,omitempty"`
+	// Replay recorded requests during every analysis stage.
+	// +optional
+	Replay *ReplaySpec `json:"replay,omitempty"`
 }
 
 // CheckSpec configures one quality check.
@@ -211,6 +245,8 @@ const (
 	ConditionStalled     = "Stalled"
 	// ConditionPayloadCapture reports whether raw payload capture is on.
 	ConditionPayloadCapture = "PayloadCapture"
+	// ConditionReplay reports whether recorded requests can be replayed.
+	ConditionReplay = "Replay"
 )
 
 // ShadowStepIndex is CurrentStep during the shadow stage.

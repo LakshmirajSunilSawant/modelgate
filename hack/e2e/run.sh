@@ -9,6 +9,7 @@
 #   CHAOS=mesh hack/e2e/run.sh              # Chaos Mesh kills controller, analyzer, NATS
 #   CHAOS=kubectl hack/e2e/run.sh           # same kills with kubectl, no Chaos Mesh
 #   SCENARIOS="swapped:rollback" hack/e2e/run.sh
+#   RPS=0 REPLAY=1 hack/e2e/run.sh          # no live traffic: replayed requests drive analysis
 #
 # Needs docker, kind, kubectl, helm, and python with demo/model/requirements.txt.
 set -euo pipefail
@@ -22,6 +23,7 @@ SYS=modelgate-system
 NS=demo
 SETUP=${SETUP:-1}
 CHAOS=${CHAOS:-off}
+REPLAY=${REPLAY:-0}
 RPS=${RPS:-50}
 TIMEOUT=${TIMEOUT:-900}
 SCENARIOS=${SCENARIOS:-"identical:promote swapped:rollback nan:rollback scaling:rollback"}
@@ -102,6 +104,20 @@ fast_config() {
     "analysis":{"minSamples":300,"interval":"10s"}}}'
 }
 
+# Replay: record the demo dataset as JSON request bodies in a ConfigMap and
+# have ModelGate send them to stable and canary during analysis.
+replay_config() {
+  [ "$REPLAY" = 1 ] || return 0
+  log "replay of recorded requests"
+  "$PYTHON" -c 'import json; from sklearn.datasets import load_breast_cancer as d
+for r in d().data.tolist(): print(json.dumps({"features": [round(v, 5) for v in r]}))' >"$LOGDIR/requests.jsonl"
+  # Server-side apply: the file is too large for the last-applied annotation.
+  $K -n $NS create configmap demo-model-replay --from-file=requests.jsonl="$LOGDIR/requests.jsonl" \
+    --dry-run=client -o yaml | $K apply --server-side --force-conflicts -f -
+  $K -n $NS patch modelrollout demo-model --type merge -p '{"spec":{"strategy":{"replay":{
+    "configMapRef":{"name":"demo-model-replay"},"path":"/predict","ratePerSecond":40}}}}'
+}
+
 field() { $K -n $NS get modelrollout demo-model -o jsonpath="{$1}" 2>/dev/null || true; }
 
 wait_settled() {
@@ -134,6 +150,10 @@ start_load() {
     [ $SECONDS -lt $deadline ] || fail "gateway not serving on localhost:$PORT"
     sleep 2
   done
+  if [ "$RPS" = 0 ]; then
+    log "no live load"
+    return
+  fi
   "$PYTHON" demo/model/loadgen.py --url "http://localhost:$PORT/predict" --rps "$RPS" --workers 32 --duration 100000 \
     >"$LOGDIR/loadgen.log" 2>&1 &
   pids+=($!)
@@ -219,6 +239,7 @@ check_audit() {
 
 [ "$SETUP" = 1 ] && setup
 fast_config
+replay_config
 start_load
 wait_settled # a rollout left over from an earlier run finishes first
 start_chaos

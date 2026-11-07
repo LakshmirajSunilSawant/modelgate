@@ -107,6 +107,7 @@ func (r *ModelRolloutReconciler) reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	r.applyPayloadCapture(mr)
+	r.applyReplay(ctx, mr)
 	r.applySpec(mr, rev)
 	action := r.applyAction(mr)
 	if err := r.saveStatus(ctx, mr, before, pol); err != nil {

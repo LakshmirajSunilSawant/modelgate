@@ -3,6 +3,7 @@ package main
 
 import (
 	"flag"
+	"net/http"
 	"os"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -96,6 +97,8 @@ func main() {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)
 	}
+	// Replay sends recorded requests to stable and canary for low-traffic models.
+	must(mgr.Add(&controller.Replayer{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), HTTP: &http.Client{}}))
 	if *webhooks {
 		if err := mgwebhook.Setup(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook")

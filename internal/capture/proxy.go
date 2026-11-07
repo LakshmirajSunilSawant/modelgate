@@ -318,6 +318,10 @@ func sampled(id string, rate float64) bool {
 	return float64(h.Sum64()>>11)/(1<<53) < rate
 }
 
+// Sampled reports whether a sidecar with this sample rate captures the
+// request with this ID. Replay uses it to send only requests that count.
+func Sampled(id string, rate float64) bool { return sampled(id, rate) }
+
 func newID() string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])

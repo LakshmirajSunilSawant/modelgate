@@ -99,6 +99,7 @@ func TestEnvtestCRDValidation(t *testing.T) {
 	createNamespace(t, c, "demo")
 
 	mr, _ := sampleRollout(t)
+	mr.Spec.Strategy.Replay = &mgv1.ReplaySpec{ConfigMapRef: mgv1.ConfigMapKeyRef{Name: "recorded"}}
 	mr.Spec.Template.Annotations = map[string]string{"prometheus.io/scrape": "true"}
 	mr.Spec.Template.Labels = map[string]string{"team": "fraud"}
 	if err := c.Create(ctx, mr.DeepCopy()); err != nil {
@@ -112,14 +113,19 @@ func TestEnvtestCRDValidation(t *testing.T) {
 	if got.Spec.Analysis.Alpha != 0.01 || got.Spec.Capture.SampleRate != 1 {
 		t.Errorf("CRD defaults not applied: alpha=%v sampleRate=%v", got.Spec.Analysis.Alpha, got.Spec.Capture.SampleRate)
 	}
+	if rp := got.Spec.Strategy.Replay; rp.Path != "/" || rp.RatePerSecond != 5 || rp.ConfigMapRef.Key != "requests.jsonl" {
+		t.Errorf("replay defaults not applied: %+v", rp)
+	}
 
 	cases := map[string]func(*mgv1.ModelRollout){
-		"first step above 50%": func(m *mgv1.ModelRollout) { m.Spec.Strategy.Steps[0].Weight = 60 },
-		"no shadow or steps":   func(m *mgv1.ModelRollout) { m.Spec.Strategy = mgv1.StrategySpec{} },
-		"unknown check type":   func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks[0].Type = "vibes" },
-		"no checks":            func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks = nil },
-		"sample rate above 1":  func(m *mgv1.ModelRollout) { m.Spec.Strategy.Shadow.SampleRate = 1.5 },
-		"bad output type":      func(m *mgv1.ModelRollout) { m.Spec.Output.Type = "text" },
+		"first step above 50%":     func(m *mgv1.ModelRollout) { m.Spec.Strategy.Steps[0].Weight = 60 },
+		"no shadow or steps":       func(m *mgv1.ModelRollout) { m.Spec.Strategy = mgv1.StrategySpec{} },
+		"unknown check type":       func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks[0].Type = "vibes" },
+		"no checks":                func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks = nil },
+		"sample rate above 1":      func(m *mgv1.ModelRollout) { m.Spec.Strategy.Shadow.SampleRate = 1.5 },
+		"bad output type":          func(m *mgv1.ModelRollout) { m.Spec.Output.Type = "text" },
+		"replay path not absolute": func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.Path = "predict" },
+		"replay rate above 200":    func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.RatePerSecond = 500 },
 	}
 	for name, mutate := range cases {
 		bad := mr.DeepCopy()

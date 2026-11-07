@@ -3,7 +3,7 @@ TAG ?= dev
 KIND_CLUSTER ?= modelgate
 CONTROLLER_GEN ?= controller-gen
 
-.PHONY: all generate manifests test test-short envtest bench loadtest build images kind-up kind-load deploy demo smoke e2e e2e-chaos vulncheck
+.PHONY: all generate manifests test test-short envtest bench loadtest build images kind-up kind-load deploy demo smoke e2e e2e-chaos e2e-replay vulncheck
 
 all: generate manifests test build
 
@@ -38,6 +38,10 @@ e2e:
 # The same with Chaos Mesh killing the controller, analyzer and NATS.
 e2e-chaos:
 	CLUSTER=$(KIND_CLUSTER) CHAOS=mesh ./hack/e2e/run.sh
+
+# No live traffic: only replayed recorded requests feed the analysis.
+e2e-replay:
+	CLUSTER=$(KIND_CLUSTER) RPS=0 REPLAY=1 SCENARIOS="identical:promote swapped:rollback" ./hack/e2e/run.sh
 
 vulncheck:
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...

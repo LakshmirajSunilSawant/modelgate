@@ -5,12 +5,14 @@
 //	kubectl modelgate resume  <rollout> [-n ns]
 //	kubectl modelgate abort   <rollout> [-n ns]
 //	kubectl modelgate promote <rollout> --force [-n ns]
-//	kubectl modelgate payloads <rollout> [-n ns] [--request-id id] [--limit n]
+//	kubectl modelgate payloads <rollout> [-n ns] [--request-id id] [--limit n] [--requests]
 //
 // Every action records the caller's Kubernetes identity, which the
 // controller writes into the rollout's events. payloads reads redacted
 // bodies from the analyzer through the API server's service proxy, so it
-// needs the services/proxy permission in the analyzer's namespace.
+// needs the services/proxy permission in the analyzer's namespace. With
+// --requests it prints only the request bodies, one per line, ready for a
+// replay ConfigMap (spec.strategy.replay).
 package main
 
 import (
@@ -37,7 +39,7 @@ import (
 )
 
 const usage = `usage: kubectl modelgate <status|pause|resume|abort|promote|payloads> <rollout> [-n namespace] [--force] [-w]
-       [--request-id id] [--limit n] [--analyzer-namespace ns]`
+       [--request-id id] [--limit n] [--requests] [--analyzer-namespace ns]`
 
 func main() {
 	if len(os.Args) < 3 {
@@ -50,6 +52,7 @@ func main() {
 	watch := fs.Bool("w", false, "status: refresh every 2 seconds until interrupted")
 	requestID := fs.String("request-id", "", "payloads: only this request, as served by each revision")
 	limit := fs.Int("limit", 10, "payloads: most recent payloads to show")
+	requestsOnly := fs.Bool("requests", false, "payloads: print only request bodies, one JSON document per line, for a replay ConfigMap")
 	analyzerNS := fs.String("analyzer-namespace", "modelgate-system", "payloads: namespace of the modelgate-analyzer Service")
 	_ = fs.Parse(os.Args[3:])
 
@@ -99,7 +102,7 @@ func main() {
 		}
 		patch = actionPatch("promote", whoami(ctx, cfg))
 	case "payloads":
-		printPayloads(ctx, cfg, mr, *analyzerNS, *requestID, *limit)
+		printPayloads(ctx, cfg, mr, *analyzerNS, *requestID, *limit, *requestsOnly)
 		return
 	default:
 		fail(usage)
@@ -178,11 +181,16 @@ type payloadRecord struct {
 	Omitted   []string        `json:"omitted"`
 }
 
-func printPayloads(ctx context.Context, cfg *rest.Config, mr *mgv1.ModelRollout, analyzerNS, requestID string, limit int) {
+func printPayloads(ctx context.Context, cfg *rest.Config, mr *mgv1.ModelRollout, analyzerNS, requestID string, limit int, requestsOnly bool) {
+	// With --requests, stdout carries only the bodies, so notes go to stderr.
+	notes := os.Stdout
+	if requestsOnly {
+		notes = os.Stderr
+	}
 	if c := findCondition(mr, mgv1.ConditionPayloadCapture); c != nil {
-		fmt.Printf("Payload capture: %s\n\n", c.Message)
+		fmt.Fprintf(notes, "Payload capture: %s\n\n", c.Message)
 	} else {
-		fmt.Print("Payload capture is not configured (spec.capture.payloads); showing anything captured in the last hour.\n\n")
+		fmt.Fprint(notes, "Payload capture is not configured (spec.capture.payloads); showing anything captured in the last hour.\n\n")
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	check(err)
@@ -195,7 +203,11 @@ func printPayloads(ctx context.Context, cfg *rest.Config, mr *mgv1.ModelRollout,
 	var recs []payloadRecord
 	check(json.Unmarshal(body, &recs))
 	if len(recs) == 0 {
-		fmt.Println("No payloads captured in the last hour.")
+		fmt.Fprintln(notes, "No payloads captured in the last hour.")
+		return
+	}
+	if requestsOnly {
+		printRequests(recs)
 		return
 	}
 	for _, p := range recs {
@@ -221,6 +233,27 @@ func printPayloads(ctx context.Context, cfg *rest.Config, mr *mgv1.ModelRollout,
 		}
 		fmt.Println()
 	}
+}
+
+// printRequests writes each captured request body once, compacted to one
+// line. Stable and canary saw the same request, so duplicates are skipped.
+// Bodies are as captured: redacted fields hold "[REDACTED]".
+func printRequests(recs []payloadRecord) {
+	seen := map[string]bool{}
+	n := 0
+	for _, p := range recs {
+		if len(p.Request) == 0 || seen[p.RequestID] {
+			continue
+		}
+		seen[p.RequestID] = true
+		var line bytes.Buffer
+		if json.Compact(&line, p.Request) != nil {
+			continue
+		}
+		fmt.Println(line.String())
+		n++
+	}
+	fmt.Fprintf(os.Stderr, "%d requests\n", n)
 }
 
 func printBody(name string, b json.RawMessage) {
