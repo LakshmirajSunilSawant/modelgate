@@ -1,0 +1,53 @@
+# Chaos Mesh schedules for the e2e chaos run: kill one controller replica,
+# the analyzer, and NATS on staggered schedules while rollouts are in flight.
+# The test then checks that no bad canary was ever promoted.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-controller
+  namespace: modelgate-system
+spec:
+  schedule: "@every 40s"
+  type: PodChaos
+  concurrencyPolicy: Forbid
+  historyLimit: 5
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [modelgate-system]
+      labelSelectors: { app.kubernetes.io/name: modelgate-controller }
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-analyzer
+  namespace: modelgate-system
+spec:
+  schedule: "@every 90s"
+  type: PodChaos
+  concurrencyPolicy: Forbid
+  historyLimit: 5
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [modelgate-system]
+      labelSelectors: { app.kubernetes.io/name: modelgate-analyzer }
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-nats
+  namespace: modelgate-system
+spec:
+  schedule: "@every 150s"
+  type: PodChaos
+  concurrencyPolicy: Forbid
+  historyLimit: 5
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [modelgate-system]
+      labelSelectors: { app.kubernetes.io/name: nats }

@@ -1,0 +1,15 @@
+{{- if .Values.grafana.dashboard.enabled }}
+# Picked up by the Grafana sidecar (kube-prometheus-stack and the Grafana
+# chart watch for this label). The same JSON can be imported by hand from
+# charts/modelgate/dashboards/modelgate.json.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: modelgate-dashboard
+  namespace: {{ .Values.grafana.dashboard.namespace | default .Release.Namespace }}
+  labels: {{- include "modelgate.labels" . | nindent 4 }}
+    {{ .Values.grafana.dashboard.label }}: {{ .Values.grafana.dashboard.labelValue | quote }}
+data:
+  modelgate.json: |-
+{{ .Files.Get "dashboards/modelgate.json" | indent 4 }}
+{{- end }}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -129,11 +130,16 @@ const NATSSubject = "modelgate.events"
 type NATSSink struct {
 	JS      nats.JetStreamContext
 	Subject string
+
+	mu     sync.Mutex
+	stream bool
 }
 
-// NewNATSSink connects to NATS and ensures the event stream exists.
+// NewNATSSink returns a sink that connects in the background. A sidecar that
+// starts while NATS is down keeps serving and starts publishing once NATS
+// is back; batches sent in the meantime fail and are dropped.
 func NewNATSSink(url, rollout string) (*NATSSink, *nats.Conn, error) {
-	nc, err := nats.Connect(url, nats.Name("modelgate-sidecar"), nats.MaxReconnects(-1))
+	nc, err := nats.Connect(url, nats.Name("modelgate-sidecar"), nats.MaxReconnects(-1), nats.RetryOnFailedConnect(true))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -142,11 +148,20 @@ func NewNATSSink(url, rollout string) (*NATSSink, *nats.Conn, error) {
 		nc.Close()
 		return nil, nil, err
 	}
-	if err := EnsureStream(js); err != nil {
-		nc.Close()
-		return nil, nil, err
-	}
 	return &NATSSink{JS: js, Subject: SubjectFor(rollout)}, nc, nil
+}
+
+func (s *NATSSink) ensureStream() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stream {
+		return nil
+	}
+	if err := EnsureStream(s.JS); err != nil {
+		return err
+	}
+	s.stream = true
+	return nil
 }
 
 // SubjectFor maps "namespace/name" to a NATS subject.
@@ -173,6 +188,9 @@ func EnsureStream(js nats.JetStreamContext) error {
 func (s *NATSSink) Send(ctx context.Context, events []analysis.Event) error {
 	body, err := json.Marshal(events)
 	if err != nil {
+		return err
+	}
+	if err := s.ensureStream(); err != nil {
 		return err
 	}
 	_, err = s.JS.Publish(s.Subject, body, nats.Context(ctx))

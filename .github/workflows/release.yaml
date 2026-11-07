@@ -1,0 +1,159 @@
+# Release on a semver tag (v0.2.0, v0.2.0-rc.1):
+#   - multi-arch images for controller, analyzer and sidecar on GHCR
+#   - an SPDX SBOM per image (Syft), attached as a signed attestation
+#   - a vulnerability scan that fails the release on fixable critical CVEs
+#   - keyless cosign signatures (GitHub OIDC) on every image and the chart
+#   - kubectl-modelgate binaries, checksums and their signatures on the
+#     GitHub release, and the Helm chart pushed to GHCR as an OCI artifact
+#
+# Verify an image:
+#   cosign verify ghcr.io/<owner>/modelgate-controller:<tag> \
+#     --certificate-identity-regexp 'https://github.com/<owner>/<repo>/.github/workflows/release.yaml@refs/tags/v.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+name: release
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  images:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing
+    strategy:
+      matrix:
+        include:
+          - { cmd: manager, image: modelgate-controller }
+          - { cmd: analyzer, image: modelgate-analyzer }
+          - { cmd: sidecar, image: modelgate-sidecar }
+    steps:
+      - uses: actions/checkout@v4
+      - name: registry path (image references must be lowercase)
+        run: echo "REGISTRY=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: CMD=${{ matrix.cmd }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+      - name: vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ matrix.image }}.spdx.json
+          upload-artifact: true
+      - uses: sigstore/cosign-installer@v3
+      - name: sign image and attest SBOM
+        env:
+          REF: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type spdxjson --predicate "${{ matrix.image }}.spdx.json" "$REF"
+
+  plugin:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: build kubectl-modelgate
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}; ext=""
+            [ "$os" = windows ] && ext=.exe
+            out="kubectl-modelgate_${GITHUB_REF_NAME}_${os}_${arch}"
+            mkdir -p "build/$out"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "build/$out/kubectl-modelgate$ext" ./cmd/kubectl-modelgate
+            cp LICENSE "build/$out/"
+            tar -C build -czf "dist/$out.tar.gz" "$out"
+          done
+          cp config/crd/modelgate.dev_*.yaml dist/
+          (cd dist && sha256sum * > checksums.txt)
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/modelgate-source.spdx.json
+          upload-artifact: false
+      - uses: sigstore/cosign-installer@v3
+      - name: sign checksums
+        run: cosign sign-blob --yes --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## \\[?"v"\\]?" {p=1; next} /^## / {p=0} p' CHANGELOG.md)
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "${notes:-See CHANGELOG.md}" $prerelease
+
+  chart:
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: sigstore/cosign-installer@v3
+      - name: package and push chart
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          helm package charts/modelgate --version "$version" --app-version "$version" -d dist
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          out=$(helm push "dist/modelgate-$version.tgz" "oci://ghcr.io/$owner/charts" 2>&1)
+          echo "$out"
+          digest=$(echo "$out" | awk '/^Digest:/ {print $2}')
+          echo "$REGISTRY_TOKEN" | cosign login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          cosign sign --yes "ghcr.io/$owner/charts/modelgate@$digest"

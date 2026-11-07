@@ -1,0 +1,58 @@
+# A single-replica PostgreSQL for the audit log on a local kind cluster.
+# Not for production: no persistence beyond the pod, a fixed password.
+#
+#   kubectl apply -f config/samples/postgres.yaml
+#   helm upgrade --install modelgate charts/modelgate -n modelgate-system \
+#     --reuse-values --set audit.existingSecret=modelgate-audit
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modelgate-audit
+  namespace: modelgate-system
+stringData:
+  password: modelgate-demo
+  dsn: postgres://modelgate:modelgate-demo@modelgate-postgres.modelgate-system.svc:5432/modelgate?sslmode=disable
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelgate-postgres
+  namespace: modelgate-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: modelgate-postgres }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: modelgate-postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - { name: POSTGRES_USER, value: modelgate }
+            - { name: POSTGRES_DB, value: modelgate }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: modelgate-audit, key: password } }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec: { command: [pg_isready, -U, modelgate] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelgate-postgres
+  namespace: modelgate-system
+spec:
+  selector: { app.kubernetes.io/name: modelgate-postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }

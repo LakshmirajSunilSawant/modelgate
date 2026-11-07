@@ -3,7 +3,7 @@ TAG ?= dev
 KIND_CLUSTER ?= modelgate
 CONTROLLER_GEN ?= controller-gen
 
-.PHONY: all generate manifests test test-short envtest bench loadtest build images kind-up kind-load deploy demo smoke
+.PHONY: all generate manifests test test-short envtest bench loadtest build images kind-up kind-load deploy demo smoke e2e e2e-chaos vulncheck
 
 all: generate manifests test build
 
@@ -30,6 +30,17 @@ bench:
 
 loadtest:
 	go run ./hack/loadtest -rps 1000 -duration 30s
+
+# End-to-end on kind: NATS, Postgres audit log, load through Envoy Gateway.
+e2e:
+	CLUSTER=$(KIND_CLUSTER) ./hack/e2e/run.sh
+
+# The same with Chaos Mesh killing the controller, analyzer and NATS.
+e2e-chaos:
+	CLUSTER=$(KIND_CLUSTER) CHAOS=mesh ./hack/e2e/run.sh
+
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 test-short:
 	go test -short ./...

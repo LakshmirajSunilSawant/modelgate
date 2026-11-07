@@ -16,6 +16,7 @@ import (
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
+	"github.com/modelgate/modelgate/internal/audit"
 	"github.com/modelgate/modelgate/internal/controller"
 	mgwebhook "github.com/modelgate/modelgate/internal/webhook"
 )
@@ -35,6 +36,9 @@ func main() {
 		webhookPort   = flag.Int("webhook-port", 9443, "webhook server port")
 		webhookCerts  = flag.String("webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "directory with tls.crt and tls.key")
 	)
+	// The DSN carries a password, so it comes from the environment (a Secret
+	// in the Helm chart), never from a flag that shows up in the pod spec.
+	auditDSN := os.Getenv("MODELGATE_AUDIT_DSN")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -60,6 +64,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	var auditLog audit.Log
+	if auditDSN != "" {
+		pg, err := audit.NewPostgres(auditDSN)
+		if err != nil {
+			setupLog.Error(err, "invalid MODELGATE_AUDIT_DSN")
+			os.Exit(1)
+		}
+		defer pg.Close()
+		auditLog = pg
+		setupLog.Info("audit log enabled (PostgreSQL)")
+	} else {
+		setupLog.Info("audit log disabled: MODELGATE_AUDIT_DSN not set; decisions are recorded in events only")
+	}
+
 	ingest := *sidecarIngest
 	if ingest == "" {
 		ingest = *analyzerURL
@@ -72,6 +90,7 @@ func main() {
 		Sidecar:    controller.SidecarConfig{Image: *sidecarImage, AnalyzerURL: ingest + "/v1/events", NATSURL: *natsURL},
 		KillSwitch: types.NamespacedName{Namespace: *killSwitchNS, Name: *killSwitchCM},
 		APIReader:  mgr.GetAPIReader(),
+		Audit:      auditLog,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")

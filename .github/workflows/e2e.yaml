@@ -1,0 +1,47 @@
+# End-to-end tests on kind: real Envoy Gateway, NATS JetStream, PostgreSQL
+# audit log, and the demo model under load. The chaos job adds Chaos Mesh
+# pod kills of the controller, analyzer and NATS during every rollout.
+name: e2e
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rollouts
+            chaos: "off"
+            scenarios: "identical:promote swapped:rollback nan:rollback scaling:rollback stale:rollback"
+          - name: chaos
+            chaos: mesh
+            scenarios: "swapped:rollback identical:promote scaling:rollback good:promote"
+    name: e2e (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: helm/kind-action@v1
+        with: { install_only: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip, cache-dependency-path: demo/model/requirements.txt }
+      - run: pip install -r demo/model/requirements.txt
+      - name: run e2e
+        env:
+          CHAOS: ${{ matrix.chaos }}
+          SCENARIOS: ${{ matrix.scenarios }}
+          TIMEOUT: "1200"
+        run: bash hack/e2e/run.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.name }}-logs
+          path: bin/e2e/

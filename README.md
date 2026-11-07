@@ -19,10 +19,12 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | Helm chart, Dockerfiles, CI | done; installed and exercised on kind with Envoy Gateway |
 | Demo model with the PRD's six bad variants | done |
 | Namespace defaults (`ModelGatePolicy`) enforced at runtime + validating webhook | done; envtest and live on kind |
-| Postgres audit log, Grafana dashboard | **not yet** |
+| PostgreSQL audit log (verdicts, disagreement samples, every decision and actor) | done; unit, real Postgres, and live on kind |
+| Grafana dashboard (Helm ConfigMap for the Grafana sidecar) | done |
 | Delayed-label accuracy, replay mode, KServe/gRPC | **not yet** (post-v0.1) |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
-| kind e2e in CI, Chaos Mesh tests, cosign/SBOM | **not yet** (resilience was checked by hand on kind) |
+| kind e2e in CI (NATS, Postgres, Envoy Gateway), Chaos Mesh run | done; see [hack/e2e/run.sh](hack/e2e/run.sh) |
+| Release: multi-arch images, SBOMs, cosign signatures, vulnerability scans | done; [release workflow](.github/workflows/release.yaml), not yet run on a tag |
 
 ## How it works
 
@@ -116,6 +118,38 @@ kubectl modelgate promote demo-model -n demo --force
 
 The plugin looks up the caller's identity with a `SelfSubjectReview`, and the controller writes it into the rollout's events. The cluster-wide kill switch is `freeze: "true"` in ConfigMap `modelgate-system/modelgate-config`.
 
+## Audit log
+
+Set `audit.existingSecret` in the Helm chart to a Secret holding a PostgreSQL DSN (key `dsn`), and the controller records every decision in table `modelgate_audit`, which it creates on first use. A demo database for kind is in [config/samples/postgres.yaml](config/samples/postgres.yaml).
+
+- **What is recorded:** first deploys, rollout starts, every verdict with its checks and up to five disagreement samples (`verdict` jsonb), step advances, promotions, rollbacks, holds, pauses, resumes, aborts and forced promotions. Each row carries the actor: `system:modelgate-controller` for automatic decisions, the caller's Kubernetes identity for plugin actions.
+- **Ordering:** entries are written before the status change they describe, so nothing takes effect without a record. Writes are idempotent, so a retried reconcile does not record a decision twice.
+- **When the database is down:** step advances, promotions, new rollouts and forced promotions wait, and the rollout shows `Paused` with `audit log unavailable`. Rollbacks and aborts still happen. Their entries are dropped and an `AuditWriteFailed` event is emitted, because an audit outage must never keep a bad canary serving traffic.
+
+```sql
+SELECT recorded_at, action, actor, canary_revision, canary_weight, reason
+FROM modelgate_audit WHERE namespace = 'demo' AND rollout = 'demo-model'
+ORDER BY recorded_at DESC LIMIT 20;
+```
+
+Without a DSN, decisions are still recorded as Kubernetes events and in status.
+
+## Dashboard
+
+The chart installs ConfigMap `modelgate-dashboard` with label `grafana_dashboard: "1"`, which the Grafana sidecar in kube-prometheus-stack loads. It shows each rollout's phase, canary weight, verdicts, check values, promotions, rollbacks, reconcile errors, analyzer ingest, and sidecar capture outcomes. The JSON is in [charts/modelgate/dashboards/modelgate.json](charts/modelgate/dashboards/modelgate.json) for manual import; turn the ConfigMap off with `grafana.dashboard.enabled=false`.
+
+## Releases
+
+Pushing a tag `vX.Y.Z` runs [.github/workflows/release.yaml](.github/workflows/release.yaml). It publishes multi-arch (amd64, arm64) images for the controller, analyzer and sidecar to GHCR, scans them with Trivy, and attaches an SPDX SBOM to each one as a signed attestation. Images and the OCI Helm chart are signed with keyless cosign. Plugin binaries, CRDs and checksums go to the GitHub release, with the checksums signed. To verify an image:
+
+```sh
+cosign verify ghcr.io/<owner>/modelgate-controller:<version> \
+  --certificate-identity-regexp 'https://github.com/<owner>/<repo>/.github/workflows/release.yaml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Using only the analyzer (Argo Rollouts, Flagger)
 
 - Argo Rollouts: see [config/samples/argo-analysistemplate.yaml](config/samples/argo-analysistemplate.yaml). `GET /v1/argo/verdict` returns `{"decision": "pass|fail|inconclusive", ...}`, and an inconclusive verdict pauses instead of promoting.
@@ -135,10 +169,11 @@ internal/capture/      sidecar proxy, JSONPath subset, batching publisher (HTTP/
 internal/controller/   reconciler, Deployment/Service/HTTPRoute rendering, metrics
 internal/policy/       ModelGatePolicy merge (teams may only tighten)
 internal/webhook/      validating webhook for ModelRollouts
+internal/audit/        audit log interface and PostgreSQL store
 cmd/                   manager, analyzer, sidecar, kubectl-modelgate
-charts/modelgate/      Helm chart
+charts/modelgate/      Helm chart, including the Grafana dashboard
 demo/model/            FastAPI + scikit-learn demo model, bad variants, load generator
-hack/                  kind setup, local smoke test, benchmark, sidecar load test
+hack/                  kind setup, e2e and chaos suite, local smoke test, benchmark, sidecar load test
 ```
 
 ## Testing
@@ -149,12 +184,17 @@ make envtest    # controller against a real kube-apiserver + etcd
 make smoke      # real analyzer + sidecars + demo models, no cluster
 make bench      # bad-model suite, 50 runs per variant
 make loadtest   # sidecar overhead at 1,000 req/s
+make e2e        # kind: NATS, Postgres, Envoy Gateway, real rollouts under load
+make e2e-chaos  # the same while Chaos Mesh kills the controller, analyzer and NATS
+make vulncheck  # govulncheck on the module
 ```
 
 - **Unit:** sketch accuracy and bound coverage under repeated looks. 50 simulated identical-model rollouts stay under 2% false rollbacks, and each bad variant must fail on the expected check. Controller logic runs against a fake client.
 - **envtest:** the webhook behind a real API server. A loose rollout is rejected with a reason, a compliant one is accepted, annotation-only updates pass after the policy tightens, and a second policy name is refused.
 - **envtest:** the generated CRD schema, CEL rules, defaults, pod-template metadata, the status subresource, and the experimental mirror field are all enforced by a real API server. It also drives a full rollout: deploy, shadow, three steps, promote, then a bad canary rolled back.
 - **Local smoke:** all 8 demo variants through the real binaries. `good` and `identical` pass; the 6 bad variants fail.
+- **Audit:** controller tests check the recorded sequence for a full rollout, the actors for pause, resume and abort, and fail-safe behavior with the database down (holds, never promotes, still rolls back, a forced promote waits and is recorded once). `internal/audit` runs against a real PostgreSQL when `MODELGATE_TEST_POSTGRES_DSN` is set; CI runs it with a Postgres service container.
+- **kind e2e (CI):** `hack/e2e/run.sh` installs everything with NATS JetStream and the audit log, sends load through Envoy Gateway, and runs rollouts of demo variants. Good variants must promote and bad ones must roll back; a bad variant ever becoming stable fails the run at once. It then checks the audit log against the outcomes. The CI chaos job runs the same suite while Chaos Mesh kills a controller replica every 40 s, the analyzer every 90 s, and NATS every 150 s. `CHAOS=kubectl` does the same kills without Chaos Mesh.
 - **kind + Envoy Gateway:** tested by hand.
   - A good rollout promotes through every stage.
   - `swapped` and `nan` roll back in shadow with zero user exposure; `slow` rolls back at 5%.
@@ -187,7 +227,7 @@ The latency regression misses the 15-minute target at low traffic. It can only b
 
 - The canary runs the same replica count as stable.
 - Only the current template can be rendered. If someone deletes the old stable Deployment mid-rollout, the rollout stalls instead of recreating it.
-- The analyzer keeps sketches in memory. Run it with NATS so a restart can replay the last hour. The NATS path has unit-level code only and has not been run against a NATS server yet.
+- The analyzer keeps sketches in memory. Run it with NATS so a restart can replay the last hour.
 - The label-free checks will likely miss the subtle 5-point accuracy drop. Delayed labels are planned for that case.
 
 Licensed under Apache 2.0.

@@ -5,6 +5,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 	"github.com/modelgate/modelgate/internal/analysis"
+	"github.com/modelgate/modelgate/internal/audit"
 	"github.com/modelgate/modelgate/internal/policy"
 )
 
@@ -54,7 +56,15 @@ type ModelRolloutReconciler struct {
 	// does not need to watch every ConfigMap in the cluster. Defaults to Client.
 	APIReader client.Reader
 	Now       func() time.Time
+	// Audit stores every decision durably. Nil disables the audit log.
+	Audit audit.Log
+
+	// journal collects this pass's audit entries. Reconcile works on a
+	// shallow copy of the reconciler, so each pass has its own journal.
+	journal *[]audit.Entry
 }
+
+const pausedByUserMsg = "rollout paused (spec.paused)"
 
 // +kubebuilder:rbac:groups=modelgate.dev,resources=modelrollouts,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=modelgate.dev,resources=modelrollouts/status,verbs=get;update;patch
@@ -70,6 +80,12 @@ type ModelRolloutReconciler struct {
 // is safe: decisions are written to status first, then resources are
 // converged to match status. Converging is idempotent.
 func (r *ModelRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	pass := *r
+	pass.journal = &[]audit.Entry{}
+	return pass.reconcile(ctx, req)
+}
+
+func (r *ModelRolloutReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	mr := &mgv1.ModelRollout{}
 	if err := r.Get(ctx, req.NamespacedName, mr); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -139,6 +155,9 @@ func (r *ModelRolloutReconciler) now() time.Time {
 // stored spec, so the namespace policy is merged in again afterwards.
 func (r *ModelRolloutReconciler) saveStatus(ctx context.Context, mr *mgv1.ModelRollout, before *mgv1.ModelRolloutStatus, pol *mgv1.ModelGatePolicySpec) error {
 	mr.Status.ObservedGeneration = mr.Generation
+	if err := r.flushAudit(ctx, mr); err != nil {
+		return err
+	}
 	if equality.Semantic.DeepEqual(*before, mr.Status) {
 		return nil
 	}
@@ -156,8 +175,10 @@ func (r *ModelRolloutReconciler) applySpec(mr *mgv1.ModelRollout, rev string) {
 		st.Phase = mgv1.PhaseHealthy
 		st.Message = "initial revision deployed"
 		r.Recorder.Eventf(mr, corev1.EventTypeNormal, "Deployed", "revision %s deployed as stable", rev)
+		r.record(mr, audit.Entry{Action: audit.ActionDeployed, Key: rev, Reason: st.Message})
 	case rev == st.StableRevision && st.CanaryRevision != "":
 		r.Recorder.Eventf(mr, corev1.EventTypeNormal, "CanaryCancelled", "template reverted to stable %s; dropping canary %s", rev, st.CanaryRevision)
+		r.record(mr, audit.Entry{Action: audit.ActionCanaryCancelled, Key: st.CanaryRevision, Reason: "template reverted to stable revision"})
 		clearCanary(st)
 		st.Phase = mgv1.PhaseHealthy
 		st.Message = "template reverted to stable revision"
@@ -170,6 +191,7 @@ func (r *ModelRolloutReconciler) applySpec(mr *mgv1.ModelRollout, rev string) {
 	case rev != st.CanaryRevision:
 		if st.CanaryRevision != "" {
 			r.Recorder.Eventf(mr, corev1.EventTypeNormal, "CanaryReplaced", "template changed mid-rollout; replacing canary %s with %s", st.CanaryRevision, rev)
+			r.record(mr, audit.Entry{Action: audit.ActionCanaryReplaced, Key: st.CanaryRevision + ">" + rev, Reason: "replaced by " + rev})
 		}
 		now := metav1.NewTime(r.now())
 		clearCanary(st)
@@ -187,6 +209,7 @@ func (r *ModelRolloutReconciler) applySpec(mr *mgv1.ModelRollout, rev string) {
 			st.Message = fmt.Sprintf("step 1 started at %d%%", st.CanaryWeight)
 		}
 		r.Recorder.Eventf(mr, corev1.EventTypeNormal, "RolloutStarted", "canary %s against stable %s", rev, st.StableRevision)
+		r.record(mr, audit.Entry{Action: audit.ActionRolloutStarted, Key: rev, Reason: st.Message, Blocking: true})
 	}
 }
 
@@ -205,12 +228,14 @@ func (r *ModelRolloutReconciler) applyAction(mr *mgv1.ModelRollout) string {
 	switch action {
 	case "abort":
 		if st.CanaryRevision != "" {
-			r.rollback(mr, fmt.Sprintf("aborted by %s", by))
+			r.rollback(mr, by, fmt.Sprintf("aborted by %s", by))
 		}
 	case "promote":
 		if st.CanaryRevision != "" {
 			r.Recorder.Eventf(mr, corev1.EventTypeWarning, "ForcePromoted", "canary %s promoted by %s without completing analysis", st.CanaryRevision, by)
-			r.promote(mr, fmt.Sprintf("force-promoted by %s", by))
+			r.record(mr, audit.Entry{Action: audit.ActionForcePromoted, Actor: by, Key: st.CanaryRevision,
+				Reason: "promoted without completing analysis", Blocking: true})
+			r.promote(mr, by, fmt.Sprintf("force-promoted by %s", by))
 		}
 	default:
 		r.Recorder.Eventf(mr, corev1.EventTypeWarning, "UnknownAction", "ignoring %s=%q from %s", mgv1.ActionAnnotation, action, by)
@@ -227,9 +252,10 @@ func clearCanary(st *mgv1.ModelRolloutStatus) {
 	st.ConsecutiveFailures = 0
 }
 
-func (r *ModelRolloutReconciler) promote(mr *mgv1.ModelRollout, why string) {
+func (r *ModelRolloutReconciler) promote(mr *mgv1.ModelRollout, actor, why string) {
 	st := &mr.Status
 	rev := st.CanaryRevision
+	r.record(mr, audit.Entry{Action: audit.ActionPromoted, Actor: actor, Key: rev, Reason: why, Blocking: true})
 	st.StableRevision = rev
 	clearCanary(st)
 	st.Phase = mgv1.PhaseHealthy
@@ -237,9 +263,10 @@ func (r *ModelRolloutReconciler) promote(mr *mgv1.ModelRollout, why string) {
 	r.Recorder.Eventf(mr, corev1.EventTypeNormal, "Promoted", "revision %s promoted to stable: %s", rev, why)
 }
 
-func (r *ModelRolloutReconciler) rollback(mr *mgv1.ModelRollout, why string) {
+func (r *ModelRolloutReconciler) rollback(mr *mgv1.ModelRollout, actor, why string) {
 	st := &mr.Status
 	rev := st.CanaryRevision
+	r.record(mr, audit.Entry{Action: audit.ActionRolledBack, Actor: actor, Key: rev, Reason: why})
 	st.AbortedRevision = rev
 	clearCanary(st)
 	st.Phase = mgv1.PhaseDegraded
@@ -417,8 +444,13 @@ func (r *ModelRolloutReconciler) analyze(ctx context.Context, mr *mgv1.ModelRoll
 		return ctrl.Result{RequeueAfter: waitForPodsInterval}
 	}
 	if mr.Spec.Paused {
-		r.hold(mr, "PausedByUser", "rollout paused (spec.paused)")
+		r.hold(mr, "PausedByUser", pausedByUserMsg)
 		return ctrl.Result{RequeueAfter: interval}
+	}
+	if st.Phase == mgv1.PhasePaused && st.Message == pausedByUserMsg {
+		st.Phase = mgv1.PhaseProgressing
+		st.Message = "resumed"
+		r.record(mr, audit.Entry{Action: audit.ActionResumed, Actor: actionBy(mr), Reason: "spec.paused cleared"})
 	}
 	if on, why := r.frozen(ctx); on {
 		r.hold(mr, "KillSwitch", why)
@@ -458,6 +490,9 @@ func (r *ModelRolloutReconciler) analyze(ctx context.Context, mr *mgv1.ModelRoll
 	}
 	st.Looks++
 	st.LastVerdict = verdictStatus(v, st.StableRevision, st.CanaryRevision, r.now())
+	verdictJSON, _ := json.Marshal(st.LastVerdict)
+	r.record(mr, audit.Entry{Action: audit.ActionVerdict, Key: fmt.Sprintf("%d/%d", st.CurrentStep, st.Looks),
+		Reason: v.Decision + ": " + v.Reason, Verdict: verdictJSON})
 	decisions.WithLabelValues(mr.Namespace, mr.Name, v.Decision).Inc()
 	for _, c := range v.Checks {
 		if c.Status == analysis.Pass || c.Status == analysis.Fail {
@@ -477,9 +512,9 @@ func (r *ModelRolloutReconciler) analyze(ctx context.Context, mr *mgv1.ModelRoll
 		st.ConsecutiveFailures++
 		r.Recorder.Eventf(mr, corev1.EventTypeWarning, "CheckFailed", "%s (failure %d/%d)", v.Reason, st.ConsecutiveFailures, limit)
 		if v.HardFailure {
-			r.rollback(mr, "hard failure: "+v.Reason)
+			r.rollback(mr, audit.ControllerActor, "hard failure: "+v.Reason)
 		} else if st.ConsecutiveFailures >= limit {
-			r.rollback(mr, v.Reason)
+			r.rollback(mr, audit.ControllerActor, v.Reason)
 		} else {
 			st.Message = fmt.Sprintf("check failed (%d/%d): %s", st.ConsecutiveFailures, limit, v.Reason)
 		}
@@ -497,6 +532,12 @@ func (r *ModelRolloutReconciler) analyze(ctx context.Context, mr *mgv1.ModelRoll
 		st.Message = stageName(mr) + ": passing, stage time remaining"
 		return ctrl.Result{RequeueAfter: interval}
 	}
+	// Promotions and step changes are only made when they can be audited.
+	if err := r.auditLog().Ping(ctx); err != nil {
+		logger.Error(err, "audit log unavailable; holding rollout")
+		r.hold(mr, "AuditUnavailable", "audit log unavailable, holding at current weight: "+err.Error())
+		return ctrl.Result{RequeueAfter: interval}
+	}
 	r.advance(mr)
 	return ctrl.Result{RequeueAfter: time.Second}
 }
@@ -505,6 +546,11 @@ func (r *ModelRolloutReconciler) hold(mr *mgv1.ModelRollout, reason, msg string)
 	st := &mr.Status
 	if st.Phase != mgv1.PhasePaused || st.Message != msg {
 		r.Recorder.Event(mr, corev1.EventTypeWarning, reason, msg)
+		actor := audit.ControllerActor
+		if reason == "PausedByUser" {
+			actor = actionBy(mr)
+		}
+		r.record(mr, audit.Entry{Action: audit.ActionHeld, Actor: actor, Reason: reason + ": " + msg})
 	}
 	st.Phase = mgv1.PhasePaused
 	st.Message = msg
@@ -532,7 +578,7 @@ func (r *ModelRolloutReconciler) advance(mr *mgv1.ModelRollout) {
 	next := st.CurrentStep + 1
 	if int(next) >= len(mr.Spec.Strategy.Steps) {
 		decisions.WithLabelValues(mr.Namespace, mr.Name, "promote").Inc()
-		r.promote(mr, "all analysis stages passed")
+		r.promote(mr, audit.ControllerActor, "all analysis stages passed")
 		return
 	}
 	from := stageName(mr)
@@ -544,6 +590,68 @@ func (r *ModelRolloutReconciler) advance(mr *mgv1.ModelRollout) {
 	st.ConsecutiveFailures = 0
 	st.Message = stageName(mr) + " started"
 	r.Recorder.Eventf(mr, corev1.EventTypeNormal, "StepAdvanced", "%s passed; %s", from, st.Message)
+	r.record(mr, audit.Entry{Action: audit.ActionStepAdvanced, Key: fmt.Sprint(next), Reason: from + " passed", Blocking: true})
+}
+
+func actionBy(mr *mgv1.ModelRollout) string {
+	if by := mr.Annotations[mgv1.ActionByAnnotation]; by != "" {
+		return by
+	}
+	return "unknown"
+}
+
+func (r *ModelRolloutReconciler) auditLog() audit.Log {
+	if r.Audit == nil {
+		return audit.Noop{}
+	}
+	return r.Audit
+}
+
+// record queues an audit entry for this pass. It fills in the rollout's
+// identity and the state at the moment of the decision.
+func (r *ModelRolloutReconciler) record(mr *mgv1.ModelRollout, e audit.Entry) {
+	if r.journal == nil {
+		return
+	}
+	st := mr.Status
+	e.Time = r.now()
+	e.Namespace, e.Rollout, e.RolloutUID = mr.Namespace, mr.Name, string(mr.UID)
+	if e.Actor == "" {
+		e.Actor = audit.ControllerActor
+	}
+	if e.StableRevision == "" {
+		e.StableRevision = st.StableRevision
+	}
+	if e.CanaryRevision == "" {
+		e.CanaryRevision = st.CanaryRevision
+	}
+	e.Step, e.CanaryWeight = st.CurrentStep, st.CanaryWeight
+	*r.journal = append(*r.journal, e)
+}
+
+// flushAudit writes the pass's entries before its status is saved, so no
+// decision takes effect without a record. If the write fails and an entry is
+// blocking (a promotion, step advance, or rollout start), the pass fails and
+// is retried. Other entries, including rollbacks, are dropped with a warning:
+// an audit outage must never keep a bad canary serving traffic.
+func (r *ModelRolloutReconciler) flushAudit(ctx context.Context, mr *mgv1.ModelRollout) error {
+	if r.journal == nil || len(*r.journal) == 0 {
+		return nil
+	}
+	entries := *r.journal
+	*r.journal = nil
+	err := r.auditLog().Write(ctx, entries)
+	if err == nil {
+		return nil
+	}
+	for _, e := range entries {
+		if e.Blocking {
+			return fmt.Errorf("recording %s in audit log: %w", e.Action, err)
+		}
+	}
+	log.FromContext(ctx).Error(err, "audit write failed; continuing because no entry is blocking", "entries", len(entries))
+	r.Recorder.Eventf(mr, corev1.EventTypeWarning, "AuditWriteFailed", "%d audit entries not recorded: %v", len(entries), err)
+	return nil
 }
 
 func (r *ModelRolloutReconciler) setReadiness(mr *mgv1.ModelRollout) {

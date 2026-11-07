@@ -7,12 +7,25 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_PASSWORD: pg }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - run: go vet ./...
       - run: go test -race ./...
+        env:
+          MODELGATE_TEST_POSTGRES_DSN: postgres://postgres:pg@localhost:5432/postgres?sslmode=disable
+      - name: vulnerability scan (Go dependencies)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
       - name: envtest (real kube-apiserver)
         run: |
           go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21

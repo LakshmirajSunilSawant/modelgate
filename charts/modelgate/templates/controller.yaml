@@ -34,6 +34,12 @@ spec:
             {{- if .Values.webhook.enabled }}
             - --enable-webhooks=true
             {{- end }}
+          {{- if .Values.audit.existingSecret }}
+          env:
+            - name: MODELGATE_AUDIT_DSN
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.audit.existingSecret }}, key: {{ .Values.audit.secretKey }} }
+          {{- end }}
           ports:
             - { name: metrics, containerPort: 8080 }
             - { name: probes, containerPort: 8081 }
