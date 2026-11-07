@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -38,6 +40,16 @@ func main() {
 		SampleRate: envFloat("MODELGATE_SAMPLE_RATE", 1),
 		ScoreMin:   envFloatPtr("MODELGATE_SCORE_MIN"),
 		ScoreMax:   envFloatPtr("MODELGATE_SCORE_MAX"),
+	}
+	if until := os.Getenv("MODELGATE_PAYLOAD_UNTIL"); until != "" {
+		pc, err := payloadConfig(until)
+		if err != nil {
+			// Never capture bodies on a config that might skip redaction.
+			log.Error("payload capture disabled: bad config", "err", err)
+		} else {
+			cfg.Payloads = pc
+			log.Info("payload capture on", "until", pc.Until, "sampleRate", pc.SampleRate, "redactPaths", len(pc.Redact))
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -96,6 +108,30 @@ func main() {
 	for _, s := range servers {
 		_ = s.Shutdown(shutdown)
 	}
+}
+
+// payloadConfig reads the payload capture settings the controller sets.
+func payloadConfig(until string) (capture.PayloadConfig, error) {
+	var pc capture.PayloadConfig
+	t, err := time.Parse(time.RFC3339, until)
+	if err != nil {
+		return pc, fmt.Errorf("MODELGATE_PAYLOAD_UNTIL: %w", err)
+	}
+	var paths []string
+	if v := os.Getenv("MODELGATE_PAYLOAD_REDACT"); v != "" {
+		if err := json.Unmarshal([]byte(v), &paths); err != nil {
+			return pc, fmt.Errorf("MODELGATE_PAYLOAD_REDACT: %w", err)
+		}
+	}
+	if pc.Redact, err = capture.ParseRedactPaths(paths); err != nil {
+		return pc, err
+	}
+	pc.Until = t
+	pc.SampleRate = envFloat("MODELGATE_PAYLOAD_SAMPLE_RATE", 0.01)
+	if n, err := strconv.Atoi(os.Getenv("MODELGATE_PAYLOAD_MAX_BYTES")); err == nil && n > 0 {
+		pc.MaxBytes = n
+	}
+	return pc, nil
 }
 
 type dropSink struct{}

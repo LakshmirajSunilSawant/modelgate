@@ -22,7 +22,8 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | PostgreSQL audit log (verdicts, disagreement samples, every decision and actor) | done; unit, real Postgres, and live on kind |
 | Grafana dashboard (Helm ConfigMap for the Grafana sidecar) | done |
 | Delayed-label accuracy (`labelAccuracy` check, `/v1/outcomes` API) | done; unit, benchmark, live on kind |
-| Replay mode, KServe/gRPC, raw payload capture | **not yet** (post-v0.1) |
+| Opt-in, time-limited payload capture with redaction in the sidecar | done; unit and controller tests |
+| Replay mode, KServe/gRPC | **not yet** (post-v0.1) |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
 | kind e2e in CI (NATS, Postgres, Envoy Gateway), Chaos Mesh run | done; see [hack/e2e/run.sh](hack/e2e/run.sh) |
 | Release: multi-arch images, SBOMs, cosign signatures, vulnerability scans | done; [release workflow](.github/workflows/release.yaml), not yet run on a tag |
@@ -146,9 +147,35 @@ kubectl modelgate pause   demo-model -n demo
 kubectl modelgate resume  demo-model -n demo
 kubectl modelgate abort   demo-model -n demo
 kubectl modelgate promote demo-model -n demo --force
+kubectl modelgate payloads demo-model -n demo   # see Payload capture
 ```
 
 The plugin looks up the caller's identity with a `SelfSubjectReview`, and the controller writes it into the rollout's events. The cluster-wide kill switch is `freeze: "true"` in ConfigMap `modelgate-system/modelgate-config`.
+
+## Payload capture for debugging
+
+By default the sidecar sends only the extracted prediction, latency and status, never request or response bodies. When a disagreement needs a closer look, turn on payload capture for a limited time:
+
+```yaml
+spec:
+  capture:
+    payloads:
+      until: "2026-11-07T18:00:00Z"   # at most 24 hours ahead
+      sampleRate: 0.01                # share of requests, default 0.01
+      maxBytes: 8192                  # largest body kept, default 8192
+      redact: ["$.instances[*].ssn", "$.patient.*", "$['card number']"]
+```
+
+```sh
+kubectl modelgate payloads demo-model -n demo                    # the 10 newest
+kubectl modelgate payloads demo-model -n demo --request-id 4f1c  # stable and canary for one request
+```
+
+- **Redaction happens in the sidecar**, before anything leaves the pod: each path's values become `"[REDACTED]"`. Paths support `.key`, `['key']`, `[n]`, `[*]` and `.*`. Only JSON bodies are captured, because only a parsed body can be redacted reliably. Bodies that are not JSON, are truncated, or are larger than `maxBytes` are left out and the record says why. Headers are never captured.
+- **It ends by itself.** The sidecar stops at `until`, so capture ends on time even if the controller is down. The webhook rejects an `until` more than 24 hours ahead; if the webhook is bypassed, the controller keeps capture off and says so in the `PayloadCapture` condition. Expiry does not restart pods. Turning capture on or off, or changing its settings, rolls the model pods, like any other capture setting.
+- **Stable and canary keep the same requests.** Payload sampling uses the request ID, like event sampling, so you can compare both responses to one request. Each sidecar keeps at most 20 payloads per second.
+- **Where it goes:** payloads travel with the events to the analyzer, which keeps the last 500 per rollout for an hour in memory and serves them at `GET /v1/payloads?rollout=ns/name[&requestId=...]`. With NATS, events, including payloads, are also stored in the JetStream stream for an hour. The plugin reads them through the API server's service proxy, so it needs `services/proxy` on `modelgate-analyzer` in `modelgate-system`. The analyzer API itself has no authentication; restrict it with a NetworkPolicy if other workloads share the cluster.
+- **Namespace policy:** `spec.payloadCapture.disabled: true` in the `ModelGatePolicy` forbids capture in the namespace, and `spec.payloadCapture.redact` adds paths every rollout must redact.
 
 ## Audit log
 

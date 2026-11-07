@@ -31,6 +31,7 @@ import (
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 	"github.com/modelgate/modelgate/internal/analysis"
 	"github.com/modelgate/modelgate/internal/audit"
+	"github.com/modelgate/modelgate/internal/capture"
 	"github.com/modelgate/modelgate/internal/policy"
 )
 
@@ -105,6 +106,7 @@ func (r *ModelRolloutReconciler) reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	r.applyPayloadCapture(mr)
 	r.applySpec(mr, rev)
 	action := r.applyAction(mr)
 	if err := r.saveStatus(ctx, mr, before, pol); err != nil {
@@ -141,7 +143,62 @@ func (r *ModelRolloutReconciler) reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
+	// Come back when payload capture ends, so the condition says so on time.
+	if c := meta.FindStatusCondition(mr.Status.Conditions, mgv1.ConditionPayloadCapture); c != nil && c.Reason == payloadActive {
+		if left := mr.Spec.Capture.Payloads.Until.Sub(r.now()); left > 0 && (result.RequeueAfter == 0 || left < result.RequeueAfter) {
+			result.RequeueAfter = left + time.Second
+		}
+	}
 	return result, nil
+}
+
+// Reasons of the PayloadCapture condition.
+const (
+	payloadActive    = "Active"
+	payloadExpired   = "Expired"
+	payloadPast      = "UntilInPast"
+	payloadTooLong   = "UntilTooFar"
+	payloadBadConfig = "InvalidRedactPath"
+)
+
+// applyPayloadCapture records in the PayloadCapture condition whether raw
+// payload capture may run. The sidecar is configured for capture only when
+// the condition allows it, and the sidecar itself stops at the deadline. An
+// expired capture keeps its sidecar settings, so expiry restarts no pods.
+func (r *ModelRolloutReconciler) applyPayloadCapture(mr *mgv1.ModelRollout) {
+	pc := mr.Spec.Capture.Payloads
+	if pc == nil {
+		meta.RemoveStatusCondition(&mr.Status.Conditions, mgv1.ConditionPayloadCapture)
+		return
+	}
+	until := pc.Until.UTC().Format(time.RFC3339)
+	off := func(reason, msg string) {
+		setCondition(mr, mgv1.ConditionPayloadCapture, metav1.ConditionFalse, reason, msg)
+	}
+	left := pc.Until.Sub(r.now())
+	_, pathErr := capture.ParseRedactPaths(pc.Redact)
+	switch {
+	case pathErr != nil:
+		off(payloadBadConfig, "payload capture is off: "+pathErr.Error())
+	case left <= 0 && payloadCaptureAllowed(mr):
+		off(payloadExpired, "payload capture ended at "+until)
+	case left <= 0:
+		off(payloadPast, "payload capture is off: until "+until+" has passed")
+	case left > mgv1.MaxPayloadCaptureWindow:
+		off(payloadTooLong, fmt.Sprintf("payload capture is off: until must be at most %s ahead", mgv1.MaxPayloadCaptureWindow))
+	default:
+		setCondition(mr, mgv1.ConditionPayloadCapture, metav1.ConditionTrue, payloadActive, "capturing redacted payloads until "+until)
+	}
+}
+
+// payloadCaptureAllowed reports whether the sidecar gets the payload
+// capture settings. Expired settings stay, so nothing restarts at expiry.
+func payloadCaptureAllowed(mr *mgv1.ModelRollout) bool {
+	if mr.Spec.Capture.Payloads == nil {
+		return false
+	}
+	c := meta.FindStatusCondition(mr.Status.Conditions, mgv1.ConditionPayloadCapture)
+	return c != nil && (c.Reason == payloadActive || c.Reason == payloadExpired)
 }
 
 func (r *ModelRolloutReconciler) now() time.Time {

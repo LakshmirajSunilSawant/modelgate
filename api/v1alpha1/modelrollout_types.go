@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -128,6 +130,43 @@ type CaptureSpec struct {
 	// +kubebuilder:default=1
 	// +optional
 	SampleRate float64 `json:"sampleRate,omitempty"`
+	// Payloads records redacted request and response bodies for debugging.
+	// It is off unless set, and it switches itself off at payloads.until.
+	// +optional
+	Payloads *PayloadCaptureSpec `json:"payloads,omitempty"`
+}
+
+// MaxPayloadCaptureWindow is how far ahead payloads.until may be.
+const MaxPayloadCaptureWindow = 24 * time.Hour
+
+// PayloadCaptureSpec turns on raw payload capture for a limited time. Only
+// JSON bodies are kept, so that every redact path can be applied; other
+// bodies, and bodies larger than maxBytes, are left out. Headers are never
+// captured. Redaction happens in the sidecar, before anything leaves the pod.
+type PayloadCaptureSpec struct {
+	// Capture stops at this time. It must be at most 24 hours ahead;
+	// otherwise capture stays off and the PayloadCapture condition says why.
+	Until metav1.Time `json:"until"`
+	// Share of requests whose bodies are kept. Only requests that are also
+	// captured for analysis qualify, and the same ones are picked on stable
+	// and canary, so both responses to one request can be compared.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	// +kubebuilder:default=0.01
+	// +optional
+	SampleRate float64 `json:"sampleRate,omitempty"`
+	// Largest body kept, in bytes.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65536
+	// +kubebuilder:default=8192
+	// +optional
+	MaxBytes int32 `json:"maxBytes,omitempty"`
+	// JSONPath fields replaced with "[REDACTED]" in request and response
+	// bodies, such as $.instances[*].ssn or $.patient.*. Supports .key,
+	// ['key'], [n], [*] and .*.
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	Redact []string `json:"redact,omitempty"`
 }
 
 // ModelRolloutSpec defines the desired model deployment and how new
@@ -170,6 +209,8 @@ const (
 	ConditionReady       = "Ready"
 	ConditionReconciling = "Reconciling"
 	ConditionStalled     = "Stalled"
+	// ConditionPayloadCapture reports whether raw payload capture is on.
+	ConditionPayloadCapture = "PayloadCapture"
 )
 
 // ShadowStepIndex is CurrentStep during the shadow stage.

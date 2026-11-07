@@ -6,6 +6,7 @@ package policy
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 	"github.com/modelgate/modelgate/internal/analysis"
@@ -92,7 +93,40 @@ func Apply(p *mgv1.ModelGatePolicySpec, spec *mgv1.ModelRolloutSpec) Result {
 		res.Tightened = append(res.Tightened, fmt.Sprintf("first step weight %d%% is above policy maximum %d%%", steps[0].Weight, *p.MaxFirstStepWeight))
 		steps[0].Weight = *p.MaxFirstStepWeight
 	}
+	applyPayloadCapture(p.PayloadCapture, &spec.Capture, &res)
 	return res
+}
+
+// applyPayloadCapture removes payload capture where the policy forbids it and
+// adds the policy's redact paths. It builds a new spec rather than editing
+// the rollout's, so applying it again changes nothing.
+func applyPayloadCapture(p *mgv1.PolicyPayloadCapture, c *mgv1.CaptureSpec, res *Result) {
+	if p == nil || c.Payloads == nil {
+		return
+	}
+	if p.Disabled {
+		res.Tightened = append(res.Tightened, "payload capture is disabled by policy")
+		c.Payloads = nil
+		return
+	}
+	have := map[string]bool{}
+	for _, r := range c.Payloads.Redact {
+		have[r] = true
+	}
+	var missing []string
+	for _, r := range p.Redact {
+		if !have[r] {
+			have[r] = true
+			missing = append(missing, r)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	merged := *c.Payloads
+	merged.Redact = append(append([]string(nil), c.Payloads.Redact...), missing...)
+	c.Payloads = &merged
+	res.Added = append(res.Added, "payload redaction of "+strings.Join(missing, ", ")+" required by policy")
 }
 
 // covers reports whether a rollout check in phase rp runs everywhere a

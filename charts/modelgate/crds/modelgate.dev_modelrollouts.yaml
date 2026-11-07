@@ -142,6 +142,45 @@ spec:
               capture:
                 description: CaptureSpec configures the injected capture sidecar.
                 properties:
+                  payloads:
+                    description: |-
+                      Payloads records redacted request and response bodies for debugging.
+                      It is off unless set, and it switches itself off at payloads.until.
+                    properties:
+                      maxBytes:
+                        default: 8192
+                        description: Largest body kept, in bytes.
+                        format: int32
+                        maximum: 65536
+                        minimum: 1
+                        type: integer
+                      redact:
+                        description: |-
+                          JSONPath fields replaced with "[REDACTED]" in request and response
+                          bodies, such as $.instances[*].ssn or $.patient.*. Supports .key,
+                          ['key'], [n], [*] and .*.
+                        items:
+                          type: string
+                        maxItems: 64
+                        type: array
+                      sampleRate:
+                        default: 0.01
+                        description: |-
+                          Share of requests whose bodies are kept. Only requests that are also
+                          captured for analysis qualify, and the same ones are picked on stable
+                          and canary, so both responses to one request can be compared.
+                        maximum: 1
+                        minimum: 0
+                        type: number
+                      until:
+                        description: |-
+                          Capture stops at this time. It must be at most 24 hours ahead;
+                          otherwise capture stays off and the PayloadCapture condition says why.
+                        format: date-time
+                        type: string
+                    required:
+                    - until
+                    type: object
                   sampleRate:
                     default: 1
                     description: Share of requests whose predictions are recorded,

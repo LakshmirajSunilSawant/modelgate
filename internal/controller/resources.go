@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strconv"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -126,6 +127,21 @@ func buildSidecar(mr *mgv1.ModelRollout, rev string, sc SidecarConfig) corev1.Co
 		}
 		if r.Max != nil {
 			env = append(env, corev1.EnvVar{Name: "MODELGATE_SCORE_MAX", Value: formatFloat(*r.Max)})
+		}
+	}
+	if pc := mr.Spec.Capture.Payloads; payloadCaptureAllowed(mr) {
+		rate := pc.SampleRate
+		if rate == 0 {
+			rate = 0.01
+		}
+		redact, _ := json.Marshal(pc.Redact)
+		env = append(env,
+			corev1.EnvVar{Name: "MODELGATE_PAYLOAD_UNTIL", Value: pc.Until.UTC().Format(time.RFC3339)},
+			corev1.EnvVar{Name: "MODELGATE_PAYLOAD_SAMPLE_RATE", Value: formatFloat(rate)},
+			corev1.EnvVar{Name: "MODELGATE_PAYLOAD_REDACT", Value: string(redact)},
+		)
+		if pc.MaxBytes > 0 {
+			env = append(env, corev1.EnvVar{Name: "MODELGATE_PAYLOAD_MAX_BYTES", Value: fmt.Sprint(pc.MaxBytes)})
 		}
 	}
 	sidecar := corev1.Container{

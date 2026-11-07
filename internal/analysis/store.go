@@ -4,6 +4,7 @@
 package analysis
 
 import (
+	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -12,7 +13,7 @@ import (
 )
 
 // Event is one captured request/response pair, as emitted by the sidecar.
-// Raw payloads are never part of an event; only extracted fields.
+// Raw payloads are part of an event only while payload capture is on.
 type Event struct {
 	Rollout   string    `json:"rollout"`  // "namespace/name"
 	Revision  string    `json:"revision"` // pod template hash of the serving version
@@ -26,6 +27,27 @@ type Event struct {
 	// prediction could not be used: unparseable JSON, NaN, missing field,
 	// or a value outside the declared range.
 	Invalid string `json:"invalid,omitempty"`
+	// Payload holds redacted bodies while payload capture is on.
+	Payload *Payload `json:"payload,omitempty"`
+}
+
+// Payload is a redacted copy of a request and its response. Bodies that
+// could not be redacted are left out, and Omitted says why.
+type Payload struct {
+	Request  json.RawMessage `json:"request,omitempty"`
+	Response json.RawMessage `json:"response,omitempty"`
+	Omitted  []string        `json:"omitted,omitempty"`
+}
+
+// PayloadRecord is a captured payload as the analyzer keeps it.
+type PayloadRecord struct {
+	RequestID string    `json:"requestId"`
+	Revision  string    `json:"revision"`
+	Time      time.Time `json:"ts"`
+	Status    int       `json:"status"`
+	Label     *string   `json:"label,omitempty"`
+	Score     *float64  `json:"score,omitempty"`
+	Payload
 }
 
 // IsError reports whether the request failed at the server or transport.
@@ -38,6 +60,8 @@ const (
 	maxSamples    = 25      // disagreement samples kept per rollout
 	maxIDsPerRoll = 2_000   // look counters kept per rollout
 	maxAwaiting   = 200_000 // predictions held per rollout while waiting for a label
+	maxPayloads   = 500     // payloads kept per rollout, newest first out
+	payloadTTL    = time.Hour
 )
 
 // Outcome is a ground-truth label that arrives after the prediction was
@@ -167,6 +191,7 @@ type rolloutData struct {
 	pairs    map[pairKey]map[int64]*PairStats
 	pending  map[string]pending // request ID -> first-seen event
 	samples  []Disagreement     // ring buffer, newest last
+	payloads []PayloadRecord    // ring buffer, newest last
 	looks    map[string]int     // window key -> number of verdicts served
 	lastSeen time.Time
 }
@@ -257,6 +282,10 @@ func (s *Store) Ingest(events ...Event) {
 		}
 		r := s.rollout(e.Rollout)
 		r.lastSeen = now
+		if e.Payload != nil {
+			s.keepPayload(r, &e)
+			e.Payload = nil // pairing and label buffers keep the event; not its bodies
+		}
 		b := s.bucketOf(e.Time)
 		buckets, ok := r.revs[e.Revision]
 		if !ok {
@@ -272,6 +301,39 @@ func (s *Store) Ingest(events ...Event) {
 		s.pair(r, &e, now)
 		s.await(r, &e)
 	}
+}
+
+func (s *Store) keepPayload(r *rolloutData, e *Event) {
+	if len(r.payloads) >= maxPayloads {
+		r.payloads = append(r.payloads[:0], r.payloads[1:]...)
+	}
+	r.payloads = append(r.payloads, PayloadRecord{RequestID: e.RequestID, Revision: e.Revision, Time: e.Time,
+		Status: e.Status, Label: e.Label, Score: e.Score, Payload: *e.Payload})
+}
+
+// Payloads returns a rollout's captured payloads, newest first. A non-empty
+// requestID returns only that request's payloads, one per revision that
+// served it. limit <= 0 means no limit.
+func (s *Store) Payloads(rollout, requestID string, limit int) []PayloadRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rollouts[rollout]
+	if !ok {
+		return nil
+	}
+	cutoff := s.now().Add(-payloadTTL)
+	out := []PayloadRecord{}
+	for i := len(r.payloads) - 1; i >= 0; i-- {
+		p := r.payloads[i]
+		if p.Time.Before(cutoff) || (requestID != "" && p.RequestID != requestID) {
+			continue
+		}
+		out = append(out, p)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 // await keeps a classification until its label arrives or LabelTTL passes.
@@ -514,6 +576,14 @@ func (s *Store) GC() {
 				delete(r.awaiting, id)
 			}
 		}
+		keep := r.payloads[:0]
+		for _, p := range r.payloads {
+			if now.Sub(p.Time) <= payloadTTL {
+				keep = append(keep, p)
+			}
+		}
+		clear(r.payloads[len(keep):]) // release the dropped bodies
+		r.payloads = keep
 	}
 }
 

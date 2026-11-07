@@ -116,6 +116,21 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              payloadCapture:
+                description: Rules for raw payload capture (spec.capture.payloads).
+                properties:
+                  disabled:
+                    description: Disabled forbids payload capture for every rollout
+                      in the namespace.
+                    type: boolean
+                  redact:
+                    description: Fields redacted on top of each rollout's own redact
+                      list.
+                    items:
+                      type: string
+                    maxItems: 64
+                    type: array
+                type: object
             type: object
         type: object
         x-kubernetes-validations:

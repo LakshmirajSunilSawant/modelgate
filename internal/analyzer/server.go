@@ -51,6 +51,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/events", s.handleEvents)
 	mux.HandleFunc("POST /v1/outcomes", s.handleOutcomes)
 	mux.HandleFunc("POST /v1/verdict", s.handleVerdict)
+	mux.HandleFunc("GET /v1/payloads", s.handlePayloads)
 	mux.HandleFunc("GET /v1/argo/verdict", s.handleArgo)
 	mux.HandleFunc("POST /v1/flagger/check", s.handleFlagger)
 	mux.HandleFunc("GET /v1/rollouts", func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +169,28 @@ func validate(req *analysis.Request) error {
 //
 // Inconclusive verdicts satisfy neither condition, so Argo reports the
 // measurement as inconclusive and pauses rather than promoting.
+// handlePayloads lists redacted payloads captured in the last hour, newest
+// first: GET /v1/payloads?rollout=ns/name[&requestId=...][&limit=n].
+// Bodies were redacted in the sidecar before they were sent here.
+func (s *Server) handlePayloads(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rollout := q.Get("rollout")
+	if rollout == "" {
+		http.Error(w, "rollout is required", http.StatusBadRequest)
+		return
+	}
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		limit = min(n, 500)
+	}
+	writeJSON(w, http.StatusOK, s.Engine.Store.Payloads(rollout, q.Get("requestId"), limit))
+}
+
 func (s *Server) handleArgo(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	req, err := requestFromParams(func(k string) string { return q.Get(k) })

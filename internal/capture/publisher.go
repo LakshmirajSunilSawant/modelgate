@@ -97,11 +97,61 @@ type HTTPSink struct {
 	Client *http.Client
 }
 
+// Batches are split so one request or message stays under these sizes.
+// The analyzer accepts 16 MiB per request; NATS accepts 1 MiB per message
+// by default.
+const (
+	httpChunkBytes = 4 << 20
+	natsChunkBytes = 512 << 10
+)
+
+// encodeChunks encodes events as JSON arrays of at most limit bytes each.
+// An event too large on its own is sent without its payload, so its
+// prediction still counts.
+func encodeChunks(events []analysis.Event, limit int) ([][]byte, error) {
+	var chunks [][]byte
+	cur := []byte{'['}
+	for i := range events {
+		b, err := json.Marshal(&events[i])
+		if err != nil {
+			return nil, err
+		}
+		if len(b)+2 > limit && events[i].Payload != nil {
+			e := events[i]
+			e.Payload = nil
+			if b, err = json.Marshal(&e); err != nil {
+				return nil, err
+			}
+		}
+		if len(cur) > 1 && len(cur)+len(b)+1 > limit {
+			chunks = append(chunks, append(cur, ']'))
+			cur = []byte{'['}
+		}
+		if len(cur) > 1 {
+			cur = append(cur, ',')
+		}
+		cur = append(cur, b...)
+	}
+	if len(cur) > 1 {
+		chunks = append(chunks, append(cur, ']'))
+	}
+	return chunks, nil
+}
+
 func (s *HTTPSink) Send(ctx context.Context, events []analysis.Event) error {
-	body, err := json.Marshal(events)
+	chunks, err := encodeChunks(events, httpChunkBytes)
 	if err != nil {
 		return err
 	}
+	for _, body := range chunks {
+		if err := s.post(ctx, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *HTTPSink) post(ctx context.Context, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -186,13 +236,17 @@ func EnsureStream(js nats.JetStreamContext) error {
 }
 
 func (s *NATSSink) Send(ctx context.Context, events []analysis.Event) error {
-	body, err := json.Marshal(events)
+	chunks, err := encodeChunks(events, natsChunkBytes)
 	if err != nil {
 		return err
 	}
 	if err := s.ensureStream(); err != nil {
 		return err
 	}
-	_, err = s.JS.Publish(s.Subject, body, nats.Context(ctx))
-	return err
+	for _, body := range chunks {
+		if _, err := s.JS.Publish(s.Subject, body, nats.Context(ctx)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

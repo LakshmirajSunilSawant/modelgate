@@ -9,6 +9,13 @@ minor versions may change it; such changes are called out below.
 
 ### Added
 
+- Opt-in raw payload capture for debugging (`spec.capture.payloads`). It is
+  time-limited (`until`, at most 24 hours ahead), redacts JSONPath fields in
+  the sidecar before anything leaves the pod, captures only JSON bodies, and
+  never captures headers. The analyzer keeps the last 500 payloads per
+  rollout for an hour (`GET /v1/payloads`), and `kubectl modelgate payloads`
+  shows them. A `ModelGatePolicy` can forbid payload capture or require
+  redaction paths.
 - `ModelGatePolicy`: one policy per namespace, named `default`, that teams
   can only tighten. The controller merges it into every rollout and reports
   the result in the `PolicyApplied` condition. A validating webhook rejects

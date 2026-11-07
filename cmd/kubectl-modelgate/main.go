@@ -5,12 +5,16 @@
 //	kubectl modelgate resume  <rollout> [-n ns]
 //	kubectl modelgate abort   <rollout> [-n ns]
 //	kubectl modelgate promote <rollout> --force [-n ns]
+//	kubectl modelgate payloads <rollout> [-n ns] [--request-id id] [--limit n]
 //
 // Every action records the caller's Kubernetes identity, which the
-// controller writes into the rollout's events.
+// controller writes into the rollout's events. payloads reads redacted
+// bodies from the analyzer through the API server's service proxy, so it
+// needs the services/proxy permission in the analyzer's namespace.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -32,7 +36,8 @@ import (
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
 )
 
-const usage = `usage: kubectl modelgate <status|pause|resume|abort|promote> <rollout> [-n namespace] [--force] [-w]`
+const usage = `usage: kubectl modelgate <status|pause|resume|abort|promote|payloads> <rollout> [-n namespace] [--force] [-w]
+       [--request-id id] [--limit n] [--analyzer-namespace ns]`
 
 func main() {
 	if len(os.Args) < 3 {
@@ -43,6 +48,9 @@ func main() {
 	ns := fs.String("n", "", "namespace (defaults to the kubeconfig context's)")
 	force := fs.Bool("force", false, "required for promote: skip remaining analysis")
 	watch := fs.Bool("w", false, "status: refresh every 2 seconds until interrupted")
+	requestID := fs.String("request-id", "", "payloads: only this request, as served by each revision")
+	limit := fs.Int("limit", 10, "payloads: most recent payloads to show")
+	analyzerNS := fs.String("analyzer-namespace", "modelgate-system", "payloads: namespace of the modelgate-analyzer Service")
 	_ = fs.Parse(os.Args[3:])
 
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
@@ -90,6 +98,9 @@ func main() {
 			fail("promote skips the quality gate; pass --force to confirm")
 		}
 		patch = actionPatch("promote", whoami(ctx, cfg))
+	case "payloads":
+		printPayloads(ctx, cfg, mr, *analyzerNS, *requestID, *limit)
+		return
 	default:
 		fail(usage)
 	}
@@ -152,6 +163,85 @@ func printStatus(mr *mgv1.ModelRollout) {
 			}
 		}
 	}
+}
+
+// payloadRecord mirrors the analyzer's /v1/payloads response.
+type payloadRecord struct {
+	RequestID string          `json:"requestId"`
+	Revision  string          `json:"revision"`
+	Time      time.Time       `json:"ts"`
+	Status    int             `json:"status"`
+	Label     *string         `json:"label"`
+	Score     *float64        `json:"score"`
+	Request   json.RawMessage `json:"request"`
+	Response  json.RawMessage `json:"response"`
+	Omitted   []string        `json:"omitted"`
+}
+
+func printPayloads(ctx context.Context, cfg *rest.Config, mr *mgv1.ModelRollout, analyzerNS, requestID string, limit int) {
+	if c := findCondition(mr, mgv1.ConditionPayloadCapture); c != nil {
+		fmt.Printf("Payload capture: %s\n\n", c.Message)
+	} else {
+		fmt.Print("Payload capture is not configured (spec.capture.payloads); showing anything captured in the last hour.\n\n")
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	check(err)
+	params := map[string]string{"rollout": mr.Namespace + "/" + mr.Name, "limit": fmt.Sprint(limit)}
+	if requestID != "" {
+		params["requestId"] = requestID
+	}
+	body, err := cs.CoreV1().Services(analyzerNS).ProxyGet("http", "modelgate-analyzer", "http", "/v1/payloads", params).DoRaw(ctx)
+	check(err)
+	var recs []payloadRecord
+	check(json.Unmarshal(body, &recs))
+	if len(recs) == 0 {
+		fmt.Println("No payloads captured in the last hour.")
+		return
+	}
+	for _, p := range recs {
+		role := ""
+		switch p.Revision {
+		case mr.Status.StableRevision:
+			role = " (stable)"
+		case mr.Status.CanaryRevision:
+			role = " (canary)"
+		}
+		pred := ""
+		if p.Label != nil {
+			pred = " label=" + *p.Label
+		}
+		if p.Score != nil {
+			pred += fmt.Sprintf(" score=%g", *p.Score)
+		}
+		fmt.Printf("%s  %s  revision %s%s  status %d%s\n", p.Time.Format("15:04:05"), p.RequestID, p.Revision, role, p.Status, pred)
+		printBody("request", p.Request)
+		printBody("response", p.Response)
+		for _, o := range p.Omitted {
+			fmt.Printf("  omitted %s\n", o)
+		}
+		fmt.Println()
+	}
+}
+
+func printBody(name string, b json.RawMessage) {
+	if len(b) == 0 {
+		return
+	}
+	var out bytes.Buffer
+	if json.Indent(&out, b, "    ", "  ") != nil {
+		out.Reset()
+		out.Write(b)
+	}
+	fmt.Printf("  %s:\n    %s\n", name, out.String())
+}
+
+func findCondition(mr *mgv1.ModelRollout, t string) *metav1.Condition {
+	for i := range mr.Status.Conditions {
+		if mr.Status.Conditions[i].Type == t {
+			return &mr.Status.Conditions[i]
+		}
+	}
+	return nil
 }
 
 func score(s string) string {

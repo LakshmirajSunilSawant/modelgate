@@ -104,3 +104,35 @@ func TestPerCheckMinSamplesCannotUndercutFloor(t *testing.T) {
 		t.Errorf("tightened %v", res.Tightened)
 	}
 }
+
+func TestPolicyCanForbidPayloadCapture(t *testing.T) {
+	s := spec()
+	s.Capture.Payloads = &mgv1.PayloadCaptureSpec{SampleRate: 0.1}
+	res := Apply(&mgv1.ModelGatePolicySpec{PayloadCapture: &mgv1.PolicyPayloadCapture{Disabled: true}}, s)
+	if s.Capture.Payloads != nil {
+		t.Error("payload capture still on")
+	}
+	if len(res.Tightened) != 1 {
+		t.Errorf("tightened %v", res.Tightened)
+	}
+}
+
+func TestPolicyRedactPathsAreAddedOnce(t *testing.T) {
+	s := spec()
+	own := []string{"$.ssn"}
+	s.Capture.Payloads = &mgv1.PayloadCaptureSpec{Redact: own}
+	pol := &mgv1.ModelGatePolicySpec{PayloadCapture: &mgv1.PolicyPayloadCapture{Redact: []string{"$.ssn", "$.name"}}}
+	res := Apply(pol, s)
+	if got := strings.Join(s.Capture.Payloads.Redact, ","); got != "$.ssn,$.name" {
+		t.Errorf("redact %s", got)
+	}
+	if len(res.Added) != 1 || len(res.Tightened) != 0 {
+		t.Errorf("added %v tightened %v", res.Added, res.Tightened)
+	}
+	if len(own) != 1 {
+		t.Error("the rollout's own redact list was modified")
+	}
+	if Apply(pol, s).Changed() {
+		t.Error("applying the policy twice changed the rollout again")
+	}
+}

@@ -17,3 +17,7 @@ spec:
     - { name: valid,     type: validity,      max: 0 }
     - { name: errors,    type: errorRate,     max: 0.01 }
     - { name: latency,   type: p99Ratio,      max: 1.2 }
+  # Payload capture (spec.capture.payloads) may run, but these fields are
+  # always redacted. Set disabled: true to forbid it in this namespace.
+  payloadCapture:
+    redact: ["$.ssn", "$.patient.*"]

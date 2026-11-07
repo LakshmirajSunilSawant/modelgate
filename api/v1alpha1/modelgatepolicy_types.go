@@ -32,6 +32,20 @@ type ModelGatePolicySpec struct {
 	// +kubebuilder:validation:Maximum=100
 	// +optional
 	MaxFirstStepWeight *int32 `json:"maxFirstStepWeight,omitempty"`
+	// Rules for raw payload capture (spec.capture.payloads).
+	// +optional
+	PayloadCapture *PolicyPayloadCapture `json:"payloadCapture,omitempty"`
+}
+
+// PolicyPayloadCapture limits raw payload capture in a namespace.
+type PolicyPayloadCapture struct {
+	// Disabled forbids payload capture for every rollout in the namespace.
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
+	// Fields redacted on top of each rollout's own redact list.
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	Redact []string `json:"redact,omitempty"`
 }
 
 // +kubebuilder:object:root=true

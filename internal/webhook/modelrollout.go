@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	mgv1 "github.com/modelgate/modelgate/api/v1alpha1"
+	"github.com/modelgate/modelgate/internal/capture"
 	"github.com/modelgate/modelgate/internal/policy"
 )
 
@@ -27,6 +29,7 @@ const Path = "/validate-modelgate-dev-v1alpha1-modelrollout"
 // RolloutValidator rejects rollouts looser than the namespace policy.
 type RolloutValidator struct {
 	Reader client.Reader
+	Now    func() time.Time // defaults to time.Now
 }
 
 // Setup registers the webhook with the manager's webhook server.
@@ -62,6 +65,9 @@ func (v *RolloutValidator) validate(ctx context.Context, obj runtime.Object) (ad
 	if !ok {
 		return nil, fmt.Errorf("expected a ModelRollout, got %T", obj)
 	}
+	if err := validatePayloads(mr, v.now()); err != nil {
+		return nil, err
+	}
 	pol := &mgv1.ModelGatePolicy{}
 	err := v.Reader.Get(ctx, types.NamespacedName{Namespace: mr.Namespace, Name: mgv1.PolicyName}, pol)
 	switch {
@@ -78,4 +84,27 @@ func (v *RolloutValidator) validate(ctx context.Context, obj runtime.Object) (ad
 			mr.Name, mr.Namespace, mgv1.PolicyName, strings.Join(res.Tightened, "; "))
 	}
 	return warnings, nil
+}
+
+func (v *RolloutValidator) now() time.Time {
+	if v.Now != nil {
+		return v.Now()
+	}
+	return time.Now()
+}
+
+// validatePayloads rejects payload capture that the controller would refuse
+// to switch on, so the mistake shows at apply time.
+func validatePayloads(mr *mgv1.ModelRollout, now time.Time) error {
+	pc := mr.Spec.Capture.Payloads
+	if pc == nil {
+		return nil
+	}
+	if _, err := capture.ParseRedactPaths(pc.Redact); err != nil {
+		return fmt.Errorf("spec.capture.payloads.redact: %w", err)
+	}
+	if pc.Until.Sub(now) > mgv1.MaxPayloadCaptureWindow {
+		return fmt.Errorf("spec.capture.payloads.until: must be at most %s ahead, so payload capture always ends", mgv1.MaxPayloadCaptureWindow)
+	}
+	return nil
 }

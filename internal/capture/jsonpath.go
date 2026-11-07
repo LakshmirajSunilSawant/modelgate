@@ -9,18 +9,21 @@ import (
 	"strings"
 )
 
-// Path is a compiled subset of JSONPath: $.a.b[0].c and $['a'].
+// Path is a compiled subset of JSONPath: $.a.b[0].c and $['a'], plus the
+// wildcards [*] and .* for redaction paths.
 // This covers the response shapes of common HTTP model servers
 // (KServe v1/v2, BentoML, FastAPI) without a general JSONPath engine.
 type Path struct {
 	raw   string
 	steps []step
+	wild  bool // has a wildcard step; such a path can only redact
 }
 
 type step struct {
 	key   string
 	index int
 	isIdx bool
+	wild  bool // every member of an object or element of an array
 }
 
 // ParsePath compiles an expression. An empty expression yields a nil path.
@@ -45,7 +48,12 @@ func ParsePath(expr string) (*Path, error) {
 			if end == 0 {
 				return nil, fmt.Errorf("jsonpath %q: empty key", expr)
 			}
-			p.steps = append(p.steps, step{key: rest[:end]})
+			if rest[:end] == "*" {
+				p.steps = append(p.steps, step{wild: true})
+				p.wild = true
+			} else {
+				p.steps = append(p.steps, step{key: rest[:end]})
+			}
 			rest = rest[end:]
 		case '[':
 			end := strings.IndexByte(rest, ']')
@@ -54,6 +62,11 @@ func ParsePath(expr string) (*Path, error) {
 			}
 			inner := rest[1:end]
 			rest = rest[end+1:]
+			if inner == "*" {
+				p.steps = append(p.steps, step{wild: true})
+				p.wild = true
+				continue
+			}
 			if len(inner) >= 2 && (inner[0] == '\'' || inner[0] == '"') && inner[len(inner)-1] == inner[0] {
 				p.steps = append(p.steps, step{key: inner[1 : len(inner)-1]})
 				continue
@@ -72,8 +85,15 @@ func ParsePath(expr string) (*Path, error) {
 
 func (p *Path) String() string { return p.raw }
 
-// Get resolves the path against a decoded JSON document.
+// HasWildcard reports whether the path contains [*] or .*.
+func (p *Path) HasWildcard() bool { return p.wild }
+
+// Get resolves the path against a decoded JSON document. A path with a
+// wildcard never resolves to a single value.
 func (p *Path) Get(doc any) (any, bool) {
+	if p.wild {
+		return nil, false
+	}
 	cur := doc
 	for _, s := range p.steps {
 		if s.isIdx {

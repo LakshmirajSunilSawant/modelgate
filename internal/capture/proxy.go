@@ -32,6 +32,7 @@ type Config struct {
 	ScoreMax        *float64
 	MaxBodyBytes    int64  // responses larger than this are not parsed
 	RequestIDHeader string // default x-request-id
+	Payloads        PayloadConfig
 }
 
 // Publisher ships events off the request path. Publish must never block.
@@ -43,12 +44,14 @@ type Publisher interface {
 type Metrics struct {
 	Requests prometheus.Counter
 	Captured *prometheus.CounterVec
+	Payloads *prometheus.CounterVec
 }
 
 func newMetrics() *Metrics {
 	return &Metrics{
 		Requests: prometheus.NewCounter(prometheus.CounterOpts{Name: "modelgate_sidecar_requests_total", Help: "Requests proxied."}),
 		Captured: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "modelgate_sidecar_captured_total", Help: "Captured events by outcome."}, []string{"outcome"}),
+		Payloads: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "modelgate_sidecar_payloads_total", Help: "Payload captures by outcome: captured, or rate_limited."}, []string{"outcome"}),
 	}
 }
 
@@ -61,6 +64,8 @@ type Proxy struct {
 	score   *Path
 	pub     Publisher
 	rp      *httputil.ReverseProxy
+	limiter payloadLimiter
+	now     func() time.Time
 	Metrics *Metrics
 }
 
@@ -69,6 +74,8 @@ type ctxKey struct{}
 type capture struct {
 	start time.Time
 	id    string
+	// reqBody is set when this request's payload is captured.
+	reqBody *boundedBody
 }
 
 // NewProxy builds the proxy.
@@ -90,7 +97,15 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{cfg: cfg, label: label, score: score, pub: pub, Metrics: newMetrics()}
+	for _, path := range []*Path{label, score} {
+		if path != nil && path.HasWildcard() {
+			return nil, fmt.Errorf("jsonpath %s: wildcards are only allowed in redact paths", path)
+		}
+	}
+	if cfg.Payloads.MaxBytes <= 0 {
+		cfg.Payloads.MaxBytes = 8192
+	}
+	p := &Proxy{cfg: cfg, label: label, score: score, pub: pub, now: time.Now, Metrics: newMetrics()}
 
 	// The upstream is one local model server, so keep enough idle
 	// connections for full concurrency; the default of 2 churns connections
@@ -112,7 +127,7 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if c, ok := r.Context().Value(ctxKey{}).(*capture); ok {
-				p.emit(c, http.StatusBadGateway, nil, "")
+				p.emit(c, http.StatusBadGateway, nil, "", p.payload(c, nil, false, "model server unreachable"))
 			}
 			w.WriteHeader(http.StatusBadGateway)
 		},
@@ -122,7 +137,7 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 
 // Collectors returns the proxy's metrics for registration.
 func (p *Proxy) Collectors() []prometheus.Collector {
-	return []prometheus.Collector{p.Metrics.Requests, p.Metrics.Captured}
+	return []prometheus.Collector{p.Metrics.Requests, p.Metrics.Captured, p.Metrics.Payloads}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -133,9 +148,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set(p.cfg.RequestIDHeader, id)
 	}
 	if sampled(id, p.cfg.SampleRate) {
-		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, &capture{start: time.Now(), id: id}))
+		c := &capture{start: p.now(), id: id}
+		if p.wantPayload(id, c.start) {
+			c.reqBody = &boundedBody{src: r.Body, limit: p.cfg.Payloads.MaxBytes}
+			if r.Body == nil || r.Body == http.NoBody {
+				c.reqBody.src = http.NoBody
+			} else {
+				r.Body = c.reqBody
+			}
+		}
+		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, c))
 	}
 	p.rp.ServeHTTP(w, r)
+}
+
+// wantPayload decides whether to keep this request's bodies. Sampling uses
+// the request ID, like event sampling, so stable and canary keep the same
+// requests; because the payload rate is applied to the same hash, the
+// payload set is always within the captured set.
+func (p *Proxy) wantPayload(id string, now time.Time) bool {
+	pc := &p.cfg.Payloads
+	if pc.Until.IsZero() || !now.Before(pc.Until) || !sampled(id, pc.SampleRate) {
+		return false
+	}
+	if !p.limiter.allow(now) {
+		p.Metrics.Payloads.WithLabelValues("rate_limited").Inc()
+		return false
+	}
+	return true
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
@@ -143,23 +183,56 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	if !ok {
 		return nil
 	}
-	if resp.StatusCode >= 300 || resp.Header.Get("Content-Encoding") != "" {
-		resp.Body = &onClose{ReadCloser: resp.Body, fn: func() { p.emit(c, resp.StatusCode, nil, "") }}
+	encoded := resp.Header.Get("Content-Encoding") != ""
+	// Error bodies are only read when payloads are captured; they are useful
+	// when debugging and are never parsed for a prediction.
+	if encoded || (resp.StatusCode >= 300 && c.reqBody == nil) {
+		resp.Body = &onClose{ReadCloser: resp.Body, fn: func() {
+			p.emit(c, resp.StatusCode, nil, "", p.payload(c, nil, false, "compressed, so it cannot be redacted"))
+		}}
 		return nil
 	}
 	resp.Body = &teeBody{src: resp.Body, limit: p.cfg.MaxBodyBytes, done: func(body []byte, overflow bool) {
-		if overflow {
-			p.emit(c, resp.StatusCode, nil, "response too large to parse")
-			return
+		pl := p.payload(c, body, overflow, "")
+		switch {
+		case resp.StatusCode >= 300:
+			p.emit(c, resp.StatusCode, nil, "", pl)
+		case overflow:
+			p.emit(c, resp.StatusCode, nil, "response too large to parse", pl)
+		default:
+			p.emit(c, resp.StatusCode, body, "", pl)
 		}
-		p.emit(c, resp.StatusCode, body, "")
 	}}
 	return nil
 }
 
+// payload builds the redacted bodies for a request whose payload is
+// captured, and returns nil for every other request. respSkip, when set, is
+// why the response body was not read.
+func (p *Proxy) payload(c *capture, respBody []byte, respOverflow bool, respSkip string) *analysis.Payload {
+	if c.reqBody == nil {
+		return nil
+	}
+	pc := &p.cfg.Payloads
+	pl := &analysis.Payload{}
+	req, reqOverflow := c.reqBody.snapshot()
+	var why string
+	if pl.Request, why = redactBody(req, reqOverflow, pc); why != "" {
+		pl.Omitted = append(pl.Omitted, "request: "+why)
+	}
+	if respSkip == "" {
+		pl.Response, respSkip = redactBody(respBody, respOverflow || len(respBody) > pc.MaxBytes, pc)
+	}
+	if respSkip != "" {
+		pl.Omitted = append(pl.Omitted, "response: "+respSkip)
+	}
+	p.Metrics.Payloads.WithLabelValues("captured").Inc()
+	return pl
+}
+
 // emit builds and publishes the event. It runs after the response has been
 // streamed to the client, so parsing never delays the caller.
-func (p *Proxy) emit(c *capture, status int, body []byte, invalid string) {
+func (p *Proxy) emit(c *capture, status int, body []byte, invalid string, pl *analysis.Payload) {
 	e := analysis.Event{
 		Rollout:   p.cfg.Rollout,
 		Revision:  p.cfg.Revision,
@@ -168,6 +241,7 @@ func (p *Proxy) emit(c *capture, status int, body []byte, invalid string) {
 		LatencyMs: float64(time.Since(c.start).Microseconds()) / 1000,
 		Status:    status,
 		Invalid:   invalid,
+		Payload:   pl,
 	}
 	if body != nil && invalid == "" && status < 300 {
 		p.extract(body, &e)
