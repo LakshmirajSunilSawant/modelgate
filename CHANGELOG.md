@@ -9,6 +9,13 @@ minor versions may change it; such changes are called out below.
 
 ### Added
 
+- KServe v2 (Open Inference Protocol) support for Triton, KServe, MLServer
+  and similar servers: `output.protocol: kserveV2` (REST) or `kserveV2gRPC`,
+  with predictions read from named output tensors (`labelTensor`,
+  `scoreTensor`, reduced with `first`, `argmax` or `max`). The sidecar
+  proxies gRPC over h2c and decodes typed and raw tensor contents. The
+  controller steers a `GRPCRoute` when `routeRef.kind` is `GRPCRoute`. Only
+  inference calls are recorded.
 - Replay for low-traffic models (`spec.strategy.replay`). While a canary is
   under analysis, the controller sends recorded requests from a ConfigMap to
   both the stable and canary Services with the same request ID, so they pair

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py loadgen.py ./
+COPY app.py loadgen.py oip.py grpc_server.py ./
 ENV MODEL_VARIANT=good
 EXPOSE 8080
 USER 10001

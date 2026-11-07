@@ -85,6 +85,73 @@ func applyPlan(route *gwv1.HTTPRoute, mr *mgv1.ModelRollout, plan trafficPlan) b
 	return changed
 }
 
+// applyGRPCPlan is applyPlan for a GRPCRoute.
+func applyGRPCPlan(route *gwv1.GRPCRoute, mr *mgv1.ModelRollout, plan trafficPlan) bool {
+	// Build the HTTP form once and convert it: the backend and mirror
+	// fields are the same types in both route kinds.
+	var tmpl gwv1.HTTPRoute
+	applyPlan(&tmpl, mr, plan)
+	want := tmpl.Spec.Rules[0]
+	canarySvc := canaryServiceName(mr)
+	backends := make([]gwv1.GRPCBackendRef, 0, len(want.BackendRefs))
+	for _, b := range want.BackendRefs {
+		backends = append(backends, gwv1.GRPCBackendRef{BackendRef: b.BackendRef})
+	}
+
+	changed := false
+	if len(route.Spec.Rules) == 0 {
+		route.Spec.Rules = []gwv1.GRPCRouteRule{{}}
+		changed = true
+	}
+	for i := range route.Spec.Rules {
+		rule := &route.Spec.Rules[i]
+		var filters []gwv1.GRPCRouteFilter
+		for _, f := range rule.Filters {
+			if f.Type == gwv1.GRPCRouteFilterRequestMirror && f.RequestMirror != nil &&
+				string(f.RequestMirror.BackendRef.Name) == canarySvc {
+				continue
+			}
+			filters = append(filters, f)
+		}
+		for _, f := range want.Filters {
+			if f.Type == gwv1.HTTPRouteFilterRequestMirror {
+				filters = append(filters, gwv1.GRPCRouteFilter{Type: gwv1.GRPCRouteFilterRequestMirror, RequestMirror: f.RequestMirror})
+			}
+		}
+		if !grpcBackendsEqual(rule.BackendRefs, backends) || !filtersEqual(httpFilters(rule.Filters), httpFilters(filters)) {
+			rule.BackendRefs = append([]gwv1.GRPCBackendRef(nil), backends...)
+			rule.Filters = filters
+			changed = true
+		}
+	}
+	return changed
+}
+
+func grpcBackendsEqual(a, b []gwv1.GRPCBackendRef) bool {
+	ha := make([]gwv1.HTTPBackendRef, len(a))
+	for i := range a {
+		ha[i] = gwv1.HTTPBackendRef{BackendRef: a[i].BackendRef}
+		if len(a[i].Filters) > 0 {
+			return false
+		}
+	}
+	hb := make([]gwv1.HTTPBackendRef, len(b))
+	for i := range b {
+		hb[i] = gwv1.HTTPBackendRef{BackendRef: b[i].BackendRef}
+	}
+	return backendsEqual(ha, hb)
+}
+
+// httpFilters maps gRPC filters to HTTP ones for comparison. Only the type
+// and mirror target matter there.
+func httpFilters(fs []gwv1.GRPCRouteFilter) []gwv1.HTTPRouteFilter {
+	out := make([]gwv1.HTTPRouteFilter, len(fs))
+	for i, f := range fs {
+		out[i] = gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterType(f.Type), RequestMirror: f.RequestMirror}
+	}
+	return out
+}
+
 func backendsEqual(a, b []gwv1.HTTPBackendRef) bool {
 	if len(a) != len(b) {
 		return false

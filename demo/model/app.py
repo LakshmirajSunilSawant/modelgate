@@ -90,6 +90,22 @@ async def predict(request: Request):
     return Response(json.dumps({"prediction": pred, "variant": VARIANT}), media_type="application/json")
 
 
+@app.post("/v2/models/{model}/infer")
+async def infer_v2(model: str, request: Request):
+    """KServe v2 (Open Inference Protocol) REST, as Triton and KServe serve it."""
+    body = await request.json()
+    delay = BASE_LATENCY_S * (2 if VARIANT == "slow" else 1)
+    await asyncio.sleep(delay * random.uniform(0.7, 1.3))
+    data = body["inputs"][0]["data"]
+    features = [v for row in data for v in row] if data and isinstance(data[0], list) else data
+    pred = predict_row(features)
+    out = {"model_name": model, "id": body.get("id", ""), "outputs": [
+        {"name": "label", "datatype": "BYTES", "shape": [1, 1], "data": [pred["label"]]},
+        {"name": "confidence", "datatype": "FP32", "shape": [1, 1], "data": [pred["confidence"]]},
+    ]}
+    return Response(json.dumps(out), media_type="application/json")
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}

@@ -1,7 +1,9 @@
 # End-to-end tests on kind: real Envoy Gateway, NATS JetStream, PostgreSQL
 # audit log, and the demo model under load. The chaos job adds Chaos Mesh
 # pod kills of the controller, analyzer and NATS during every rollout. The
-# replay job sends no live traffic, so only replayed requests feed analysis.
+# replay job sends no live traffic, so only replayed requests feed analysis,
+# to a model read through KServe v2 REST tensors. The grpc job runs a KServe
+# v2 gRPC model (Triton's protocol) behind a GRPCRoute.
 name: e2e
 on:
   push: { branches: [main] }
@@ -30,7 +32,12 @@ jobs:
             chaos: "off"
             rps: "0"
             replay: "1"
+            protocol: v2
             scenarios: "identical:promote swapped:rollback"
+          - name: grpc
+            chaos: "off"
+            protocol: grpc
+            scenarios: "identical:promote swapped:rollback nan:rollback"
     name: e2e (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +53,7 @@ jobs:
           SCENARIOS: ${{ matrix.scenarios }}
           RPS: ${{ matrix.rps || '50' }}
           REPLAY: ${{ matrix.replay || '0' }}
+          PROTOCOL: ${{ matrix.protocol || 'json' }}
           TIMEOUT: "1200"
         run: bash hack/e2e/run.sh
       - if: always()

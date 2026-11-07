@@ -73,6 +73,7 @@ const pausedByUserMsg = "rollout paused (spec.paused)"
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=grpcroutes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -417,6 +418,16 @@ func (r *ModelRolloutReconciler) ensureService(ctx context.Context, mr *mgv1.Mod
 }
 
 func (r *ModelRolloutReconciler) ensureRoute(ctx context.Context, mr *mgv1.ModelRollout) error {
+	if mr.Spec.RouteRef.Kind == mgv1.RouteKindGRPC {
+		route := &gwv1.GRPCRoute{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: mr.Namespace, Name: mr.Spec.RouteRef.Name}, route); err != nil {
+			return fmt.Errorf("getting GRPCRoute %s: %w", mr.Spec.RouteRef.Name, err)
+		}
+		if !applyGRPCPlan(route, mr, planFor(mr)) {
+			return nil
+		}
+		return r.Update(ctx, route)
+	}
 	route := &gwv1.HTTPRoute{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: mr.Namespace, Name: mr.Spec.RouteRef.Name}, route); err != nil {
 		return fmt.Errorf("getting HTTPRoute %s: %w", mr.Spec.RouteRef.Name, err)

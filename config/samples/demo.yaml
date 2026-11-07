@@ -36,6 +36,7 @@ spec:
   rules:
     - matches:
         - path: { type: PathPrefix, value: /predict }
+        - path: { type: PathPrefix, value: /v2 } # KServe v2 REST (see output.protocol)
       # backendRefs and RequestMirror filters are managed by ModelGate.
 ---
 apiVersion: modelgate.dev/v1alpha1

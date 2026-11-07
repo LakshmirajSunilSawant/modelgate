@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,6 +34,11 @@ type Config struct {
 	MaxBodyBytes    int64  // responses larger than this are not parsed
 	RequestIDHeader string // default x-request-id
 	Payloads        PayloadConfig
+	// Protocol is json (default), kserveV2 or kserveV2gRPC. The kserveV2
+	// protocols read LabelTensor and ScoreTensor instead of the paths.
+	Protocol    string
+	LabelTensor *TensorSelector
+	ScoreTensor *TensorSelector
 }
 
 // Publisher ships events off the request path. Publish must never block.
@@ -105,6 +111,27 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 	if cfg.Payloads.MaxBytes <= 0 {
 		cfg.Payloads.MaxBytes = 8192
 	}
+	switch cfg.Protocol {
+	case "", ProtocolJSON:
+		cfg.Protocol = ProtocolJSON
+		if cfg.LabelTensor != nil || cfg.ScoreTensor != nil {
+			return nil, fmt.Errorf("label and score tensors need protocol %s or %s", ProtocolKServeV2, ProtocolKServeV2GRPC)
+		}
+	case ProtocolKServeV2, ProtocolKServeV2GRPC:
+		if label != nil || score != nil {
+			return nil, fmt.Errorf("protocol %s reads tensors, not label and score paths", cfg.Protocol)
+		}
+		for _, t := range []*TensorSelector{cfg.LabelTensor, cfg.ScoreTensor} {
+			if t == nil {
+				continue
+			}
+			if err := t.validate(); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown protocol %q", cfg.Protocol)
+	}
 	p := &Proxy{cfg: cfg, label: label, score: score, pub: pub, now: time.Now, Metrics: newMetrics()}
 
 	// The upstream is one local model server, so keep enough idle
@@ -113,6 +140,11 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 512
 	transport.MaxIdleConnsPerHost = 512
+	if cfg.Protocol == ProtocolKServeV2GRPC {
+		// gRPC model servers speak HTTP/2 without TLS (h2c).
+		transport.Protocols = new(http.Protocols)
+		transport.Protocols.SetUnencryptedHTTP2(true)
+	}
 
 	p.rp = &httputil.ReverseProxy{
 		Transport: transport,
@@ -122,6 +154,7 @@ func NewProxy(cfg Config, pub Publisher) (*Proxy, error) {
 			if pr.In.Context().Value(ctxKey{}) != nil {
 				// Ask for an uncompressed body so the prediction can be read.
 				pr.Out.Header.Del("Accept-Encoding")
+				pr.Out.Header.Del("Grpc-Accept-Encoding")
 			}
 		},
 		ModifyResponse: p.modifyResponse,
@@ -147,7 +180,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id = newID()
 		r.Header.Set(p.cfg.RequestIDHeader, id)
 	}
-	if sampled(id, p.cfg.SampleRate) {
+	if p.analyzed(r) && sampled(id, p.cfg.SampleRate) {
 		c := &capture{start: p.now(), id: id}
 		if p.wantPayload(id, c.start) {
 			c.reqBody = &boundedBody{src: r.Body, limit: p.cfg.Payloads.MaxBytes}
@@ -160,6 +193,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, c))
 	}
 	p.rp.ServeHTTP(w, r)
+}
+
+// analyzed reports whether the request is an inference call. With the
+// kserveV2 protocols, health, metadata and other calls pass through without
+// being recorded.
+func (p *Proxy) analyzed(r *http.Request) bool {
+	switch p.cfg.Protocol {
+	case ProtocolKServeV2:
+		return r.Method == http.MethodPost && strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/infer")
+	case ProtocolKServeV2GRPC:
+		return r.URL.Path == grpcInferMethod
+	}
+	return true
+}
+
+// status is the request's outcome as an HTTP status. gRPC reports it in
+// the grpc-status trailer, or in the headers of a trailers-only response,
+// so it is read after the body.
+func (p *Proxy) status(resp *http.Response) int {
+	if p.cfg.Protocol != ProtocolKServeV2GRPC || resp.StatusCode != http.StatusOK {
+		return resp.StatusCode
+	}
+	code := resp.Trailer.Get("Grpc-Status")
+	if code == "" {
+		code = resp.Header.Get("Grpc-Status")
+	}
+	if code == "" {
+		return http.StatusBadGateway // a gRPC response must carry a status
+	}
+	return grpcHTTPStatus(code)
 }
 
 // wantPayload decides whether to keep this request's bodies. Sampling uses
@@ -194,13 +257,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	}
 	resp.Body = &teeBody{src: resp.Body, limit: p.cfg.MaxBodyBytes, done: func(body []byte, overflow bool) {
 		pl := p.payload(c, body, overflow, "")
+		status := p.status(resp)
 		switch {
-		case resp.StatusCode >= 300:
-			p.emit(c, resp.StatusCode, nil, "", pl)
+		case status >= 300:
+			p.emit(c, status, nil, "", pl)
 		case overflow:
-			p.emit(c, resp.StatusCode, nil, "response too large to parse", pl)
+			p.emit(c, status, nil, "response too large to parse", pl)
 		default:
-			p.emit(c, resp.StatusCode, body, "", pl)
+			p.emit(c, status, body, "", pl)
 		}
 	}}
 	return nil
@@ -258,6 +322,10 @@ func (p *Proxy) emit(c *capture, status int, body []byte, invalid string, pl *an
 }
 
 func (p *Proxy) extract(body []byte, e *analysis.Event) {
+	if p.cfg.Protocol != ProtocolJSON {
+		p.extractTensors(body, e)
+		return
+	}
 	if p.label == nil && p.score == nil {
 		return
 	}
@@ -274,12 +342,9 @@ func (p *Proxy) extract(body []byte, e *analysis.Event) {
 			e.Invalid = "label not found at " + p.label.String()
 			return
 		}
-		l, ok := labelString(v)
-		if !ok {
-			e.Invalid = "label is not a scalar"
+		if !setLabel(v, e) {
 			return
 		}
-		e.Label = &l
 	}
 	if p.score != nil {
 		v, ok := p.score.Get(doc)
@@ -287,20 +352,81 @@ func (p *Proxy) extract(body []byte, e *analysis.Event) {
 			e.Invalid = "score not found at " + p.score.String()
 			return
 		}
-		f, ok := scoreFloat(v)
-		switch {
-		case !ok:
-			e.Invalid = "score is not numeric"
-		case math.IsNaN(f) || math.IsInf(f, 0):
-			e.Invalid = "score is NaN or infinite"
-		case p.cfg.ScoreMin != nil && f < *p.cfg.ScoreMin, p.cfg.ScoreMax != nil && f > *p.cfg.ScoreMax:
-			e.Invalid = "score out of range"
-		default:
-			e.Score = &f
+		p.setScore(v, e)
+	}
+}
+
+// extractTensors reads predictions from an Open Inference Protocol response.
+func (p *Proxy) extractTensors(body []byte, e *analysis.Event) {
+	if p.cfg.LabelTensor == nil && p.cfg.ScoreTensor == nil {
+		return
+	}
+	var outs []tensor
+	var err error
+	if p.cfg.Protocol == ProtocolKServeV2GRPC {
+		outs, err = parseV2GRPC(body)
+	} else {
+		outs, err = parseV2JSON(body)
+	}
+	if err != nil {
+		e.Invalid = err.Error()
+		return
+	}
+	get := func(sel *TensorSelector) (any, bool) {
+		t := findTensor(outs, sel.Name)
+		if t == nil {
+			e.Invalid = "no output tensor " + sel.Name
+			return nil, false
 		}
-		if e.Invalid != "" {
+		v, err := sel.reduce(t)
+		if err != nil {
+			e.Invalid = err.Error()
+			return nil, false
+		}
+		return v, true
+	}
+	if sel := p.cfg.LabelTensor; sel != nil {
+		v, ok := get(sel)
+		if !ok || !setLabel(v, e) {
+			return
+		}
+	}
+	if sel := p.cfg.ScoreTensor; sel != nil {
+		v, ok := get(sel)
+		if !ok {
 			e.Label = nil
+			return
 		}
+		p.setScore(v, e)
+	}
+}
+
+func setLabel(v any, e *analysis.Event) bool {
+	l, ok := labelString(v)
+	if !ok {
+		e.Invalid = "label is not a scalar"
+		return false
+	}
+	e.Label = &l
+	return true
+}
+
+// setScore validates and records the score. An invalid score also clears
+// the label, so the event counts only as invalid.
+func (p *Proxy) setScore(v any, e *analysis.Event) {
+	f, ok := scoreFloat(v)
+	switch {
+	case !ok:
+		e.Invalid = "score is not numeric"
+	case math.IsNaN(f) || math.IsInf(f, 0):
+		e.Invalid = "score is NaN or infinite"
+	case p.cfg.ScoreMin != nil && f < *p.cfg.ScoreMin, p.cfg.ScoreMax != nil && f > *p.cfg.ScoreMax:
+		e.Invalid = "score out of range"
+	default:
+		e.Score = &f
+	}
+	if e.Invalid != "" {
+		e.Label = nil
 	}
 }
 

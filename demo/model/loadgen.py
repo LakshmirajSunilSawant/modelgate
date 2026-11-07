@@ -4,6 +4,8 @@ Replays rows of the breast cancer dataset (with small noise) against a URL,
 so the canary and stable versions see the same traffic mix.
 
   python loadgen.py --url http://localhost:8080/predict --rps 50 --duration 1800
+  python loadgen.py --protocol v2 --url http://localhost:8080/v2/models/demo/infer
+  python loadgen.py --protocol grpc --url localhost:8080
 
 With --outcomes-url it also plays the part of a feedback pipeline: the true
 diagnosis of each row is posted to the analyzer's /v1/outcomes endpoint
@@ -22,6 +24,33 @@ import uuid
 from sklearn.datasets import load_breast_cancer
 
 
+def sender(protocol, url):
+    """Returns send(features, request_id), which raises on failure."""
+    if protocol == "grpc":
+        import grpc
+
+        import oip
+
+        channel = grpc.insecure_channel(url)
+        infer = channel.unary_unary(oip.INFER_METHOD, request_serializer=oip.ModelInferRequest.SerializeToString,
+                                    response_deserializer=oip.ModelInferResponse.FromString)
+
+        def send_grpc(row, rid):
+            infer(oip.infer_request(row, rid), timeout=5, metadata=(("x-request-id", rid),))
+        return send_grpc
+
+    def send_http(row, rid):
+        if protocol == "v2":
+            body = {"id": rid, "inputs": [{"name": "features", "datatype": "FP64", "shape": [1, len(row)], "data": row}]}
+        else:
+            body = {"features": row}
+        req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "X-Request-Id": rid})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    return send_http
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -32,7 +61,11 @@ def main():
     ap.add_argument("--rollout", default="demo/demo-model", help="namespace/name for outcomes")
     ap.add_argument("--label-delay", type=float, default=30, help="seconds before a label arrives")
     ap.add_argument("--label-rate", type=float, default=0.5, help="share of requests that get a label")
+    ap.add_argument("--protocol", choices=["json", "v2", "grpc"], default="json",
+                    help="json: POST {features}; v2: KServe v2 REST to --url; grpc: KServe v2 gRPC to --url host:port")
+    ap.add_argument("--check", action="store_true", help="send one request and exit 0 if it succeeds")
     args = ap.parse_args()
+    send = sender(args.protocol, args.url)
 
     data = load_breast_cancer()
     rows = data.data.tolist()
@@ -43,6 +76,13 @@ def main():
     lock = threading.Lock()
     deadline = time.time() + args.duration
     interval = args.workers / args.rps
+    if args.check:
+        try:
+            send(rows[0], uuid.uuid4().hex)
+        except Exception as e:
+            print(f"check failed: {e}")
+            raise SystemExit(1)
+        return
 
     def worker():
         while time.time() < deadline:
@@ -50,14 +90,8 @@ def main():
             i = random.randrange(len(rows))
             row = [v * random.uniform(0.97, 1.03) for v in rows[i]]
             rid = uuid.uuid4().hex
-            req = urllib.request.Request(
-                args.url,
-                data=json.dumps({"features": row}).encode(),
-                headers={"Content-Type": "application/json", "X-Request-Id": rid},
-            )
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    resp.read()
+                send(row, rid)
                 key = "ok"
                 if args.outcomes_url and random.random() < args.label_rate:
                     with labels_lock:

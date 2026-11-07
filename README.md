@@ -24,7 +24,7 @@ A model can return HTTP 200 in 40 ms and still be wrong. ModelGate catches flipp
 | Delayed-label accuracy (`labelAccuracy` check, `/v1/outcomes` API) | done; unit, benchmark, live on kind |
 | Opt-in, time-limited payload capture with redaction in the sidecar | done; unit and controller tests |
 | Replay of recorded requests for low-traffic models | done; unit, envtest, and kind e2e with no live traffic |
-| KServe/gRPC | **not yet** (post-v0.1) |
+| KServe v2 / Triton: REST and gRPC tensors, GRPCRoute | done; unit, real gRPC client and server, local smoke, kind e2e |
 | Bad-model benchmark (50 runs per variant), sidecar load test | done |
 | kind e2e in CI (NATS, Postgres, Envoy Gateway), Chaos Mesh run | done; see [hack/e2e/run.sh](hack/e2e/run.sh) |
 | Release: multi-arch images, SBOMs, cosign signatures, vulnerability scans | done; [release workflow](.github/workflows/release.yaml), not yet run on a tag |
@@ -153,6 +153,25 @@ kubectl modelgate payloads demo-model -n demo   # see Payload capture
 
 The plugin looks up the caller's identity with a `SelfSubjectReview`, and the controller writes it into the rollout's events. The cluster-wide kill switch is `freeze: "true"` in ConfigMap `modelgate-system/modelgate-config`.
 
+## KServe v2, Triton and gRPC
+
+Model servers that speak the Open Inference Protocol (KServe v2), such as Triton, KServe, MLServer and TorchServe, need no JSONPath. Name the output tensors instead:
+
+```yaml
+spec:
+  routeRef: { name: fraud, kind: GRPCRoute }   # HTTPRoute (default) for REST
+  output:
+    type: classification
+    protocol: kserveV2gRPC                      # or kserveV2 for REST, json (default) for anything else
+    labelTensor: { name: probabilities, reduce: argmax }  # label is the class index
+    scoreTensor: { name: probabilities, reduce: max }     # score is the top probability
+```
+
+- **Reading tensors.** Only the first row (the first entry along the batch dimension) is read. `reduce: first` (default) takes its first element, `argmax` the index of its largest element, and `max` the largest element. A label tensor can also be `BYTES`, like Triton's classification extension. Over gRPC, both typed `contents` and `raw_output_contents` are decoded, for every datatype including FP16 and BF16. NaN values count as invalid outputs.
+- **Which calls count.** With `kserveV2`, only POSTs to `.../infer` are recorded, and with `kserveV2gRPC`, only unary `ModelInfer` calls. Health, metadata and other calls pass through untouched. A gRPC error status is recorded as its HTTP equivalent, so `INVALID_ARGUMENT` is a client error and `INTERNAL` or `UNAVAILABLE` counts toward `errorRate`.
+- **gRPC traffic.** The sidecar accepts HTTP/2 without TLS (h2c) and speaks it to the model server. The Services get `appProtocol: kubernetes.io/h2c`, and the controller steers a `GRPCRoute` the same way it steers an HTTPRoute: backend weights for steps, `RequestMirror` for shadow. [config/samples/demo-grpc.yaml](config/samples/demo-grpc.yaml) runs the demo model as a Triton-style gRPC server.
+- **Limits.** Streaming gRPC calls pass through but are not analyzed. Payload capture keeps only JSON bodies, so it records no gRPC bodies. Replay sends JSON over HTTP, so it works with `kserveV2` REST but not with `kserveV2gRPC`; the CRD rejects that combination.
+
 ## Payload capture for debugging
 
 By default the sidecar sends only the extracted prediction, latency and status, never request or response bodies. When a disagreement needs a closer look, turn on payload capture for a limited time:
@@ -258,7 +277,7 @@ internal/webhook/      validating webhook for ModelRollouts
 internal/audit/        audit log interface and PostgreSQL store
 cmd/                   manager, analyzer, sidecar, kubectl-modelgate
 charts/modelgate/      Helm chart, including the Grafana dashboard
-demo/model/            FastAPI + scikit-learn demo model, bad variants, load generator
+demo/model/            scikit-learn demo model over JSON, KServe v2 REST and gRPC; bad variants, load generator
 hack/                  kind setup, e2e and chaos suite, local smoke test, benchmark, sidecar load test
 ```
 
@@ -279,9 +298,9 @@ make vulncheck  # govulncheck on the module
 - **Unit:** sketch accuracy and bound coverage under repeated looks. 50 simulated identical-model rollouts stay under 2% false rollbacks, and each bad variant must fail on the expected check. Controller logic runs against a fake client.
 - **envtest:** the webhook behind a real API server. A loose rollout is rejected with a reason, a compliant one is accepted, annotation-only updates pass after the policy tightens, and a second policy name is refused.
 - **envtest:** the generated CRD schema, CEL rules, defaults, pod-template metadata, the status subresource, and the experimental mirror field are all enforced by a real API server. It also drives a full rollout: deploy, shadow, three steps, promote, then a bad canary rolled back.
-- **Local smoke:** all 8 demo variants through the real binaries. `good` and `identical` pass; the 6 bad variants fail.
+- **Local smoke:** all 8 demo variants through the real binaries. `good` and `identical` pass; the 6 bad variants fail. `--protocol v2` and `--protocol grpc` run the same over KServe v2 REST and gRPC; CI runs both.
 - **Audit:** controller tests check the recorded sequence for a full rollout, the actors for pause, resume and abort, and fail-safe behavior with the database down (holds, never promotes, still rolls back, a forced promote waits and is recorded once). `internal/audit` runs against a real PostgreSQL when `MODELGATE_TEST_POSTGRES_DSN` is set; CI runs it with a Postgres service container.
-- **kind e2e (CI):** `hack/e2e/run.sh` installs everything with NATS JetStream and the audit log, sends load through Envoy Gateway, and runs rollouts of demo variants. Good variants must promote and bad ones must roll back; a bad variant ever becoming stable fails the run at once. It then checks the audit log against the outcomes. The CI chaos job runs the same suite while Chaos Mesh kills a controller replica every 40 s, the analyzer every 90 s, and NATS every 150 s. `CHAOS=kubectl` does the same kills without Chaos Mesh. The CI replay job sends no live traffic at all, so `identical` must promote and `swapped` must roll back on replayed requests alone.
+- **kind e2e (CI):** `hack/e2e/run.sh` installs everything with NATS JetStream and the audit log, sends load through Envoy Gateway, and runs rollouts of demo variants. Good variants must promote and bad ones must roll back; a bad variant ever becoming stable fails the run at once. It then checks the audit log against the outcomes. The CI chaos job runs the same suite while Chaos Mesh kills a controller replica every 40 s, the analyzer every 90 s, and NATS every 150 s. `CHAOS=kubectl` does the same kills without Chaos Mesh. The CI replay job sends no live traffic at all, so `identical` must promote and `swapped` must roll back on replayed requests alone; it reads the model through KServe v2 REST tensors. The CI grpc job runs the demo model as a KServe v2 gRPC server behind a GRPCRoute.
 - **kind + Envoy Gateway:** tested by hand.
   - A good rollout promotes through every stage.
   - `swapped` and `nan` roll back in shadow with zero user exposure; `slow` rolls back at 5%.

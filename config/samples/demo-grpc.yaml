@@ -1,0 +1,88 @@
+# The demo model over gRPC with the KServe v2 (Open Inference Protocol)
+# API, the way Triton serves models, behind a Gateway API GRPCRoute.
+# Predictions are read from the output tensors by name, so the same
+# settings work for any model server that speaks the protocol.
+#
+#   kubectl apply -f config/samples/demo-grpc.yaml
+#   python demo/model/loadgen.py --protocol grpc --url <gateway>:80
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: demo-preserve-request-id
+  namespace: demo
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: Gateway, name: demo }
+  headers:
+    requestID: Preserve
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: demo-model
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo
+  rules:
+    - matches:
+        - method: { service: inference.GRPCInferenceService }
+      # backendRefs and RequestMirror filters are managed by ModelGate.
+---
+apiVersion: modelgate.dev/v1alpha1
+kind: ModelRollout
+metadata:
+  name: demo-model
+  namespace: demo
+spec:
+  replicas: 1
+  modelPort: 8080
+  routeRef: { name: demo-model, kind: GRPCRoute }
+  template:
+    spec:
+      containers:
+        - name: model
+          image: modelgate-demo-model:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "grpc_server.py"]
+          env:
+            - { name: MODEL_VARIANT, value: good }
+          ports:
+            - { containerPort: 8080 }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+  output:
+    type: classification
+    protocol: kserveV2gRPC
+    labelTensor: { name: label }        # BYTES tensor with the class name
+    scoreTensor: { name: confidence }   # FP32 probability of "benign"
+    scoreRange: { min: 0, max: 1 }
+  strategy:
+    shadow: { duration: 5m, sampleRate: 1 }
+    steps:
+      - { weight: 5,  pause: 3m }
+      - { weight: 25, pause: 3m }
+      - { weight: 50, pause: 3m }
+  analysis:
+    minSamples: 1000
+    failureLimit: 2
+    interval: 20s
+    checks:
+      - { name: agreement,   type: agreementRate, min: 0.97, phase: shadow }
+      - { name: pred-shift,  type: psi,           max: 0.10 }
+      - { name: score-shape, type: ks,            max: 0.10 }
+      - { name: valid,       type: validity,      max: 0 }
+      - { name: latency,     type: p99Ratio,      max: 1.20 }
+      - { name: errors,      type: errorRate,     max: 0.01 }

@@ -17,11 +17,59 @@ const (
 	OutputScore          OutputType = "score"
 )
 
-// RouteRef points at the Gateway API HTTPRoute whose backends ModelGate steers.
+// RouteRef points at the Gateway API route whose backends ModelGate steers.
 // ModelGate owns the backendRefs and RequestMirror filters of every rule in
 // that route; everything else in the route is left alone.
 type RouteRef struct {
 	Name string `json:"name"`
+	// HTTPRoute, or GRPCRoute for gRPC model servers.
+	// +kubebuilder:validation:Enum=HTTPRoute;GRPCRoute
+	// +kubebuilder:default=HTTPRoute
+	// +optional
+	Kind string `json:"kind,omitempty"`
+}
+
+// Route kinds.
+const (
+	RouteKindHTTP = "HTTPRoute"
+	RouteKindGRPC = "GRPCRoute"
+)
+
+// Protocol is the model server's inference API.
+// +kubebuilder:validation:Enum=json;kserveV2;kserveV2gRPC
+type Protocol string
+
+const (
+	// ProtocolJSON is any JSON-over-HTTP API, read with labelPath and scorePath.
+	ProtocolJSON Protocol = "json"
+	// ProtocolKServeV2 is the Open Inference Protocol (KServe v2) over REST,
+	// as served by Triton, KServe, MLServer and others. Only POSTs to
+	// .../infer are analyzed.
+	ProtocolKServeV2 Protocol = "kserveV2"
+	// ProtocolKServeV2GRPC is the Open Inference Protocol over gRPC. Only
+	// unary ModelInfer calls are analyzed; other calls pass through.
+	ProtocolKServeV2GRPC Protocol = "kserveV2gRPC"
+)
+
+// Tensor reductions.
+const (
+	ReduceFirst  = "first"
+	ReduceArgmax = "argmax"
+	ReduceMax    = "max"
+)
+
+// TensorRef selects one value from a named output tensor of an Open
+// Inference Protocol response. Only the first row (the first entry along
+// the batch dimension) is read.
+type TensorRef struct {
+	// Name of the output tensor.
+	Name string `json:"name"`
+	// How the first row becomes one value: first takes its first element,
+	// argmax the index of its largest element, and max its largest element.
+	// +kubebuilder:validation:Enum=first;argmax;max
+	// +kubebuilder:default=first
+	// +optional
+	Reduce string `json:"reduce,omitempty"`
 }
 
 // Range bounds valid score values; outputs outside it count as invalid.
@@ -32,15 +80,28 @@ type Range struct {
 	Max *float64 `json:"max,omitempty"`
 }
 
-// OutputSpec says where predictions are in the model's JSON response.
+// OutputSpec says where predictions are in the model's response.
+// +kubebuilder:validation:XValidation:rule="(has(self.protocol) && self.protocol != 'json') || (!has(self.labelTensor) && !has(self.scoreTensor))",message="labelTensor and scoreTensor need protocol kserveV2 or kserveV2gRPC"
+// +kubebuilder:validation:XValidation:rule="!has(self.protocol) || self.protocol == 'json' || (!has(self.labelPath) && !has(self.scorePath))",message="labelPath and scorePath are for protocol json; use labelTensor and scoreTensor"
+// +kubebuilder:validation:XValidation:rule="!has(self.scoreTensor) || !has(self.scoreTensor.reduce) || self.scoreTensor.reduce != 'argmax'",message="scoreTensor.reduce may be first or max; argmax gives a class index, so use it in labelTensor"
 type OutputSpec struct {
 	Type OutputType `json:"type"`
+	// +kubebuilder:default=json
+	// +optional
+	Protocol Protocol `json:"protocol,omitempty"`
 	// JSONPath subset ($.a.b[0]) to the predicted class.
 	// +optional
 	LabelPath string `json:"labelPath,omitempty"`
 	// JSONPath subset to the score, confidence, or regression value.
 	// +optional
 	ScorePath string `json:"scorePath,omitempty"`
+	// Output tensor holding the predicted class, for the kserveV2 protocols.
+	// With reduce argmax, the label is the class index.
+	// +optional
+	LabelTensor *TensorRef `json:"labelTensor,omitempty"`
+	// Output tensor holding the score, for the kserveV2 protocols.
+	// +optional
+	ScoreTensor *TensorRef `json:"scoreTensor,omitempty"`
 	// +optional
 	ScoreRange *Range `json:"scoreRange,omitempty"`
 }
@@ -205,6 +266,7 @@ type PayloadCaptureSpec struct {
 
 // ModelRolloutSpec defines the desired model deployment and how new
 // versions are rolled out.
+// +kubebuilder:validation:XValidation:rule="!has(self.strategy.replay) || !has(self.output.protocol) || self.output.protocol != 'kserveV2gRPC'",message="replay sends JSON over HTTP, so it does not work with protocol kserveV2gRPC"
 type ModelRolloutSpec struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0

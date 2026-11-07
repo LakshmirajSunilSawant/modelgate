@@ -118,14 +118,28 @@ func TestEnvtestCRDValidation(t *testing.T) {
 	}
 
 	cases := map[string]func(*mgv1.ModelRollout){
-		"first step above 50%":     func(m *mgv1.ModelRollout) { m.Spec.Strategy.Steps[0].Weight = 60 },
-		"no shadow or steps":       func(m *mgv1.ModelRollout) { m.Spec.Strategy = mgv1.StrategySpec{} },
-		"unknown check type":       func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks[0].Type = "vibes" },
-		"no checks":                func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks = nil },
-		"sample rate above 1":      func(m *mgv1.ModelRollout) { m.Spec.Strategy.Shadow.SampleRate = 1.5 },
-		"bad output type":          func(m *mgv1.ModelRollout) { m.Spec.Output.Type = "text" },
-		"replay path not absolute": func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.Path = "predict" },
-		"replay rate above 200":    func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.RatePerSecond = 500 },
+		"first step above 50%":      func(m *mgv1.ModelRollout) { m.Spec.Strategy.Steps[0].Weight = 60 },
+		"no shadow or steps":        func(m *mgv1.ModelRollout) { m.Spec.Strategy = mgv1.StrategySpec{} },
+		"unknown check type":        func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks[0].Type = "vibes" },
+		"no checks":                 func(m *mgv1.ModelRollout) { m.Spec.Analysis.Checks = nil },
+		"sample rate above 1":       func(m *mgv1.ModelRollout) { m.Spec.Strategy.Shadow.SampleRate = 1.5 },
+		"bad output type":           func(m *mgv1.ModelRollout) { m.Spec.Output.Type = "text" },
+		"replay path not absolute":  func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.Path = "predict" },
+		"replay rate above 200":     func(m *mgv1.ModelRollout) { m.Spec.Strategy.Replay.RatePerSecond = 500 },
+		"tensor with json protocol": func(m *mgv1.ModelRollout) { m.Spec.Output.LabelTensor = &mgv1.TensorRef{Name: "probs"} },
+		"path with kserveV2": func(m *mgv1.ModelRollout) {
+			m.Spec.Output.Protocol = mgv1.ProtocolKServeV2
+			m.Spec.Output.LabelTensor = &mgv1.TensorRef{Name: "probs"}
+		},
+		"argmax score": func(m *mgv1.ModelRollout) {
+			m.Spec.Output = mgv1.OutputSpec{Type: mgv1.OutputScore, Protocol: mgv1.ProtocolKServeV2,
+				ScoreTensor: &mgv1.TensorRef{Name: "probs", Reduce: mgv1.ReduceArgmax}}
+		},
+		"replay with gRPC": func(m *mgv1.ModelRollout) {
+			m.Spec.Output = mgv1.OutputSpec{Type: mgv1.OutputScore, Protocol: mgv1.ProtocolKServeV2GRPC,
+				ScoreTensor: &mgv1.TensorRef{Name: "probs"}}
+		},
+		"unknown route kind": func(m *mgv1.ModelRollout) { m.Spec.RouteRef.Kind = "TCPRoute" },
 	}
 	for name, mutate := range cases {
 		bad := mr.DeepCopy()
@@ -134,6 +148,33 @@ func TestEnvtestCRDValidation(t *testing.T) {
 		if err := c.Create(ctx, bad); err == nil {
 			t.Errorf("%s: accepted, want rejection", name)
 		}
+	}
+
+	// The gRPC sample, with its GRPCRoute, is accepted as written.
+	grpcRaw, err := os.ReadFile(filepath.Join("..", "..", "config", "samples", "demo-grpc.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, doc := range strings.Split(string(grpcRaw), "\n---") {
+		var obj client.Object
+		switch {
+		case strings.Contains(doc, "kind: ModelRollout"):
+			obj = &mgv1.ModelRollout{}
+		case strings.Contains(doc, "kind: GRPCRoute"):
+			obj = &gwv1.GRPCRoute{}
+		default:
+			continue
+		}
+		if err := yaml.UnmarshalStrict([]byte(doc), obj); err != nil {
+			t.Fatalf("gRPC sample: %v", err)
+		}
+		obj.SetName("grpc-" + obj.GetName())
+		if err := c.Create(ctx, obj); err != nil {
+			t.Errorf("gRPC sample %T rejected: %v", obj, err)
+		}
+	}
+	if got.Spec.Output.Protocol != mgv1.ProtocolJSON || got.Spec.RouteRef.Kind != mgv1.RouteKindHTTP {
+		t.Errorf("protocol and route kind defaults not applied: %q %q", got.Spec.Output.Protocol, got.Spec.RouteRef.Kind)
 	}
 }
 

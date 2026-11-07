@@ -75,5 +75,8 @@ demo:
 	kubectl apply -f config/samples/demo.yaml
 
 smoke: build
-	python hack/local_smoke.py --variant good
-	python hack/local_smoke.py --variant swapped
+	python hack/local_smoke.py --variant good --expect pass
+	python hack/local_smoke.py --variant swapped --expect fail
+	python hack/local_smoke.py --variant identical --protocol v2 --expect pass
+	python hack/local_smoke.py --variant swapped --protocol grpc --expect fail
+	python hack/local_smoke.py --variant identical --protocol grpc --expect pass

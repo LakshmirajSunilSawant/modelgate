@@ -129,6 +129,20 @@ func buildSidecar(mr *mgv1.ModelRollout, rev string, sc SidecarConfig) corev1.Co
 			env = append(env, corev1.EnvVar{Name: "MODELGATE_SCORE_MAX", Value: formatFloat(*r.Max)})
 		}
 	}
+	// Set only for the kserveV2 protocols, so JSON rollouts keep their
+	// sidecar hash and are not restarted by an upgrade.
+	if out := mr.Spec.Output; out.Protocol != "" && out.Protocol != mgv1.ProtocolJSON {
+		env = append(env, corev1.EnvVar{Name: "MODELGATE_PROTOCOL", Value: string(out.Protocol)})
+		for _, t := range []struct {
+			name string
+			ref  *mgv1.TensorRef
+		}{{"MODELGATE_LABEL_TENSOR", out.LabelTensor}, {"MODELGATE_SCORE_TENSOR", out.ScoreTensor}} {
+			if t.ref != nil {
+				b, _ := json.Marshal(t.ref)
+				env = append(env, corev1.EnvVar{Name: t.name, Value: string(b)})
+			}
+		}
+	}
 	if pc := mr.Spec.Capture.Payloads; payloadCaptureAllowed(mr) {
 		rate := pc.SampleRate
 		if rate == 0 {
@@ -185,6 +199,11 @@ func withoutContainer(cs []corev1.Container, name string) []corev1.Container {
 // buildService renders a Service that selects one revision's pods and
 // targets the capture sidecar, so every request passes through it.
 func buildService(mr *mgv1.ModelRollout, name, rev string) *corev1.Service {
+	port := corev1.ServicePort{Name: "http", Port: servicePort, TargetPort: intstr.FromString("capture")}
+	if mr.Spec.Output.Protocol == mgv1.ProtocolKServeV2GRPC {
+		// Tells the gateway to speak HTTP/2 without TLS to the sidecar.
+		port.Name, port.AppProtocol = "grpc", ptr("kubernetes.io/h2c")
+	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -194,11 +213,7 @@ func buildService(mr *mgv1.ModelRollout, name, rev string) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{labelRollout: mr.Name, labelRevision: rev},
-			Ports: []corev1.ServicePort{{
-				Name:       "http",
-				Port:       servicePort,
-				TargetPort: intstr.FromString("capture"),
-			}},
+			Ports:    []corev1.ServicePort{port},
 		},
 	}
 }

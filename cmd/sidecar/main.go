@@ -40,6 +40,18 @@ func main() {
 		SampleRate: envFloat("MODELGATE_SAMPLE_RATE", 1),
 		ScoreMin:   envFloatPtr("MODELGATE_SCORE_MIN"),
 		ScoreMax:   envFloatPtr("MODELGATE_SCORE_MAX"),
+		Protocol:   os.Getenv("MODELGATE_PROTOCOL"),
+	}
+	for name, dst := range map[string]**capture.TensorSelector{
+		"MODELGATE_LABEL_TENSOR": &cfg.LabelTensor, "MODELGATE_SCORE_TENSOR": &cfg.ScoreTensor,
+	} {
+		if v := os.Getenv(name); v != "" {
+			*dst = &capture.TensorSelector{}
+			if err := json.Unmarshal([]byte(v), *dst); err != nil {
+				log.Error("bad "+name, "err", err)
+				os.Exit(1)
+			}
+		}
 	}
 	if until := os.Getenv("MODELGATE_PAYLOAD_UNTIL"); until != "" {
 		pc, err := payloadConfig(until)
@@ -89,8 +101,13 @@ func main() {
 	admin.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	admin.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
+	// The proxy also accepts HTTP/2 without TLS, which gRPC clients and
+	// gateways use for gRPC model servers.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
 	servers := []*http.Server{
-		{Addr: env("MODELGATE_LISTEN", ":8099"), Handler: proxy, ReadHeaderTimeout: 10 * time.Second},
+		{Addr: env("MODELGATE_LISTEN", ":8099"), Handler: proxy, ReadHeaderTimeout: 10 * time.Second, Protocols: protocols},
 		{Addr: env("MODELGATE_ADMIN_LISTEN", ":8098"), Handler: admin, ReadHeaderTimeout: 10 * time.Second},
 	}
 	for _, s := range servers {

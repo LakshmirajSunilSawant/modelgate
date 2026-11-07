@@ -10,6 +10,8 @@
 #   CHAOS=kubectl hack/e2e/run.sh           # same kills with kubectl, no Chaos Mesh
 #   SCENARIOS="swapped:rollback" hack/e2e/run.sh
 #   RPS=0 REPLAY=1 hack/e2e/run.sh          # no live traffic: replayed requests drive analysis
+#   PROTOCOL=grpc hack/e2e/run.sh           # KServe v2 gRPC model behind a GRPCRoute
+#   PROTOCOL=v2 hack/e2e/run.sh             # KServe v2 REST
 #
 # Needs docker, kind, kubectl, helm, and python with demo/model/requirements.txt.
 set -euo pipefail
@@ -24,6 +26,7 @@ NS=demo
 SETUP=${SETUP:-1}
 CHAOS=${CHAOS:-off}
 REPLAY=${REPLAY:-0}
+PROTOCOL=${PROTOCOL:-json}
 RPS=${RPS:-50}
 TIMEOUT=${TIMEOUT:-900}
 SCENARIOS=${SCENARIOS:-"identical:promote swapped:rollback nan:rollback scaling:rollback"}
@@ -91,7 +94,33 @@ setup() {
   $K create namespace $NS --dry-run=client -o yaml | $K apply -f -
   # A namespace policy from manual testing would reject the e2e settings.
   $K -n $NS delete modelgatepolicy --all --ignore-not-found
-  $K apply -f config/samples/demo.yaml
+  if [ "$PROTOCOL" = grpc ]; then
+    $K apply -f config/samples/demo-grpc.yaml
+  else
+    $K apply -f config/samples/demo.yaml
+  fi
+}
+
+# Where the load generator sends requests through the gateway.
+load_url() {
+  case "$PROTOCOL" in
+    grpc) echo "localhost:$PORT" ;;
+    v2) echo "http://localhost:$PORT/v2/models/demo/infer" ;;
+    *) echo "http://localhost:$PORT/predict" ;;
+  esac
+}
+
+# KServe v2 REST: same demo model, read through output tensors instead of
+# JSON paths. Only the sidecars change, so no rollout starts.
+protocol_config() {
+  [ "$PROTOCOL" = v2 ] || return 0
+  log "KServe v2 REST protocol"
+  $K -n $NS patch modelrollout demo-model --type merge -p '{"spec":{"output":{"protocol":"kserveV2",
+    "labelPath":null,"scorePath":null,"labelTensor":{"name":"label"},"scoreTensor":{"name":"confidence"}}}}'
+  sleep 5
+  for d in $($K -n $NS get deploy -l modelgate.dev/rollout=demo-model -o name); do
+    $K -n $NS rollout status "$d" --timeout=3m
+  done
 }
 
 # Short stages so the suite fits in CI. Evidence requirements stay real:
@@ -109,13 +138,18 @@ fast_config() {
 replay_config() {
   [ "$REPLAY" = 1 ] || return 0
   log "replay of recorded requests"
-  "$PYTHON" -c 'import json; from sklearn.datasets import load_breast_cancer as d
-for r in d().data.tolist(): print(json.dumps({"features": [round(v, 5) for v in r]}))' >"$LOGDIR/requests.jsonl"
+  local path=/predict
+  [ "$PROTOCOL" = v2 ] && path=/v2/models/demo/infer
+  PROTOCOL=$PROTOCOL "$PYTHON" -c 'import json, os; from sklearn.datasets import load_breast_cancer as d
+for r in d().data.tolist():
+    f = [round(v, 5) for v in r]
+    v2 = {"inputs": [{"name": "features", "datatype": "FP64", "shape": [1, len(f)], "data": f}]}
+    print(json.dumps(v2 if os.environ["PROTOCOL"] == "v2" else {"features": f}))' >"$LOGDIR/requests.jsonl"
   # Server-side apply: the file is too large for the last-applied annotation.
   $K -n $NS create configmap demo-model-replay --from-file=requests.jsonl="$LOGDIR/requests.jsonl" \
     --dry-run=client -o yaml | $K apply --server-side --force-conflicts -f -
   $K -n $NS patch modelrollout demo-model --type merge -p '{"spec":{"strategy":{"replay":{
-    "configMapRef":{"name":"demo-model-replay"},"path":"/predict","ratePerSecond":40}}}}'
+    "configMapRef":{"name":"demo-model-replay"},"path":"'"$path"'","ratePerSecond":40}}}}'
 }
 
 field() { $K -n $NS get modelrollout demo-model -o jsonpath="{$1}" 2>/dev/null || true; }
@@ -129,10 +163,14 @@ wait_settled() {
 }
 
 start_load() {
-  local svc
-  svc=$($K -n envoy-gateway-system get svc -o name \
-    -l gateway.envoyproxy.io/owning-gateway-name=demo,gateway.envoyproxy.io/owning-gateway-namespace=$NS | head -1)
-  [ -n "$svc" ] || fail "no Envoy service for gateway demo"
+  local svc="" deadline=$((SECONDS + 120))
+  # Envoy Gateway creates the Service a few seconds after the Gateway.
+  until [ -n "$svc" ]; do
+    [ $SECONDS -lt $deadline ] || fail "no Envoy service for gateway demo"
+    sleep 2
+    svc=$($K -n envoy-gateway-system get svc -o name \
+      -l gateway.envoyproxy.io/owning-gateway-name=demo,gateway.envoyproxy.io/owning-gateway-namespace=$NS | head -1)
+  done
   # Restarted if it drops. The trap stops the kubectl child with the loop.
   (
     trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM
@@ -143,21 +181,19 @@ start_load() {
     done
   ) &
   pids+=($!)
-  local deadline=$((SECONDS + 60))
-  until curl -sf -o /dev/null -X POST -H 'content-type: application/json' \
-      -d '{"features":[17.99,10.38,122.8,1001,0.1184,0.2776,0.3001,0.1471,0.2419,0.07871,1.095,0.9053,8.589,153.4,0.006399,0.04904,0.05373,0.01587,0.03003,0.006193,25.38,17.33,184.6,2019,0.1622,0.6656,0.7119,0.2654,0.4601,0.1189]}' \
-      "http://localhost:$PORT/predict"; do
-    [ $SECONDS -lt $deadline ] || fail "gateway not serving on localhost:$PORT"
+  local deadline=$((SECONDS + 90))
+  until "$PYTHON" demo/model/loadgen.py --check --protocol "$PROTOCOL" --url "$(load_url)" >/dev/null 2>&1; do
+    [ $SECONDS -lt $deadline ] || fail "gateway not serving $PROTOCOL on localhost:$PORT"
     sleep 2
   done
   if [ "$RPS" = 0 ]; then
     log "no live load"
     return
   fi
-  "$PYTHON" demo/model/loadgen.py --url "http://localhost:$PORT/predict" --rps "$RPS" --workers 32 --duration 100000 \
+  "$PYTHON" demo/model/loadgen.py --protocol "$PROTOCOL" --url "$(load_url)" --rps "$RPS" --workers 32 --duration 100000 \
     >"$LOGDIR/loadgen.log" 2>&1 &
   pids+=($!)
-  log "load running at $RPS rps"
+  log "load running at $RPS rps ($PROTOCOL)"
 }
 
 start_chaos() {
@@ -239,6 +275,7 @@ check_audit() {
 
 [ "$SETUP" = 1 ] && setup
 fast_config
+protocol_config
 replay_config
 start_load
 wait_settled # a rollout left over from an earlier run finishes first
