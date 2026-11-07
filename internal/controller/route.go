@@ -93,9 +93,20 @@ func applyGRPCPlan(route *gwv1.GRPCRoute, mr *mgv1.ModelRollout, plan trafficPla
 	applyPlan(&tmpl, mr, plan)
 	want := tmpl.Spec.Rules[0]
 	canarySvc := canaryServiceName(mr)
-	backends := make([]gwv1.GRPCBackendRef, 0, len(want.BackendRefs))
+	backends := make([]gwv1.GRPCBackendRef, 0, 2)
 	for _, b := range want.BackendRefs {
 		backends = append(backends, gwv1.GRPCBackendRef{BackendRef: b.BackendRef})
+	}
+	// The canary Service is always listed, at weight 0 when it serves no
+	// live traffic. Envoy Gateway only loads Services that GRPCRoute
+	// backendRefs name, not mirror targets, and rejects a mirror to any other
+	// Service as not found. Weight 0 sends it no traffic on any gateway.
+	if len(backends) == 1 {
+		port := gwv1.PortNumber(servicePort)
+		backends = append(backends, gwv1.GRPCBackendRef{BackendRef: gwv1.BackendRef{
+			BackendObjectReference: gwv1.BackendObjectReference{Name: gwv1.ObjectName(canarySvc), Port: &port},
+			Weight:                 ptr(int32(0)),
+		}})
 	}
 
 	changed := false

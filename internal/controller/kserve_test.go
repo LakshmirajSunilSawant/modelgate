@@ -39,9 +39,11 @@ func TestGRPCRolloutUsesGRPCRouteAndH2C(t *testing.T) {
 		}
 		return r.Spec.Rules[0]
 	}
-	// Shadow: all traffic to stable, mirrored at 20% to the canary.
+	// Shadow: all traffic to stable, mirrored at 20% to the canary. The
+	// canary is listed at weight 0 so Envoy Gateway resolves the mirror.
 	rule := grpcRoute()
-	if len(rule.BackendRefs) != 1 || rule.BackendRefs[0].Name != "fraud-stable" || *rule.BackendRefs[0].Weight != 100 {
+	if len(rule.BackendRefs) != 2 || rule.BackendRefs[0].Name != "fraud-stable" || *rule.BackendRefs[0].Weight != 100 ||
+		rule.BackendRefs[1].Name != "fraud-canary" || *rule.BackendRefs[1].Weight != 0 {
 		t.Errorf("shadow backends %+v", rule.BackendRefs)
 	}
 	if len(rule.Filters) != 2 || rule.Filters[0].Type != gwv1.GRPCRouteFilterRequestHeaderModifier ||
