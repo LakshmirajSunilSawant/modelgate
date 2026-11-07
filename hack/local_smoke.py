@@ -39,11 +39,12 @@ def wait_http(url, timeout=60):
     raise RuntimeError(f"{url} did not come up")
 
 
-def wait_ready(send, timeout=60):
+def wait_ready(make_sender, timeout=90):
     end = time.time() + timeout
     while True:
         try:
-            send([1.0] * 30, uuid.uuid4().hex)
+            # A new client each try: a gRPC channel backs off after failed connects.
+            make_sender()([1.0] * 30, uuid.uuid4().hex)
             return
         except Exception:
             if time.time() > end:
@@ -102,7 +103,7 @@ def main():
         for u in ["http://127.0.0.1:18090/healthz", "http://127.0.0.1:18098/healthz", "http://127.0.0.1:18198/healthz"]:
             wait_http(u)
         for port in [18080, 18081]:  # the model servers, directly
-            wait_ready(sender(args.protocol, target(port)))
+            wait_ready(lambda: sender(args.protocol, target(port)))
         stable, canary, direct = (sender(args.protocol, target(p)) for p in (18099, 18199, 18080))
 
         since = datetime.now(timezone.utc) - timedelta(seconds=30)
@@ -151,6 +152,11 @@ def main():
     finally:
         for p in procs:
             p.terminate()
+        for p in procs:  # free the ports before the next run starts
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
 
 
 if __name__ == "__main__":

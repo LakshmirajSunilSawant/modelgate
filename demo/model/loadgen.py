@@ -97,8 +97,11 @@ def main():
                     with labels_lock:
                         labels.append((time.time() + args.label_delay,
                                        {"rollout": args.rollout, "requestId": rid, "label": truth[i]}))
-            except Exception:
+            except Exception as e:
                 key = "err"
+                with lock:
+                    if stats["err"] < 3:
+                        print(f"request failed: {str(e)[:300]}", flush=True)
             with lock:
                 stats[key] += 1
             time.sleep(max(0, interval - (time.time() - start)))

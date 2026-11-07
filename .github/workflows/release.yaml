@@ -149,9 +149,12 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          # The packaged chart pulls the images this release published.
+          sed -i "s#^  registry: .*#  registry: ghcr.io/$owner#" charts/modelgate/values.yaml
+          grep -q "registry: ghcr.io/$owner$" charts/modelgate/values.yaml
           helm package charts/modelgate --version "$version" --app-version "$version" -d dist
           echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
-          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           out=$(helm push "dist/modelgate-$version.tgz" "oci://ghcr.io/$owner/charts" 2>&1)
           echo "$out"
           digest=$(echo "$out" | awk '/^Digest:/ {print $2}')

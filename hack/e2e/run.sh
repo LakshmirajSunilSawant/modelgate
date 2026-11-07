@@ -51,6 +51,9 @@ fail() { log "FAIL: $*"; dump; exit 1; }
 dump() {
   $K -n $NS get modelrollout demo-model -o yaml > "$LOGDIR/rollout.yaml" 2>&1 || true
   $K -n $NS get events --sort-by=.lastTimestamp > "$LOGDIR/events.txt" 2>&1 || true
+  $K -n $NS get httproute,grpcroute,gateway,service -o yaml > "$LOGDIR/routes.yaml" 2>&1 || true
+  $K -n $NS logs -l modelgate.dev/rollout=demo-model --all-containers --tail=200 --prefix > "$LOGDIR/models.log" 2>&1 || true
+  $K -n envoy-gateway-system logs deploy/envoy-gateway --tail=300 > "$LOGDIR/envoy-gateway.log" 2>&1 || true
   $K -n $SYS logs -l app.kubernetes.io/name=modelgate-controller --tail=500 --prefix > "$LOGDIR/controller.log" 2>&1 || true
   $K -n $SYS logs -l app.kubernetes.io/name=modelgate-analyzer --tail=500 > "$LOGDIR/analyzer.log" 2>&1 || true
   $K get pods -A > "$LOGDIR/pods.txt" 2>&1 || true
